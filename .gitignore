@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing / Coverage
+.pytest_cache/
+coverage/
+htmlcov/
+.coverage
+
+# Model checkpoints (large binaries)
+checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Data (large training CSVs excluded)
+data/*.csv
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+*.log
