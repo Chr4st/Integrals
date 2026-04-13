@@ -1,4 +1,4 @@
-# Verified Symbolic Integration via Hybrid CAS-Transformer Pipelines with Grammar-Constrained Sampling
+# Symbolic Integration via CAS-Transformer Pipelines with Differentiation-Verified Diverse Sampling
 
 ---
 
