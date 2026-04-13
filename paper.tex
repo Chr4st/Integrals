@@ -25,7 +25,7 @@ email address or ORCID}
 \maketitle
 
 \begin{abstract}
-Symbolic integration is a fundamental task in mathematical reasoning where computer algebra systems (CAS) implement Risch-like decision procedures but fail on deeply nested or non-elementary compositions, while neural approaches achieve broad coverage at the cost of correctness guarantees. We present a hybrid two-stage pipeline that attempts CAS integration first, then falls back to a 44.8M-parameter Transformer whose candidate antiderivatives are verified by symbolic differentiation---a perfect oracle. Building on the observation that integration admits an exact verification procedure (differentiation is cheap, always terminates, and produces no false positives), we show that temperature sampling of $N = 25$ diverse candidates yields near-certain success even with moderate per-sample accuracy, achieving a theoretical success probability of $1 - (1 - p)^N$. We introduce three supporting techniques: (i) 608-dimensional depth-encoded structural features with three-way power classification, injected via a learned \texttt{[FEAT]} token; (ii) grammar-constrained decoding via prefix-notation arity tracking that eliminates syntactically invalid candidates; and (iii) a two-phase constant resolution pipeline combining symbolic solve with Sobol quasi-random numeric optimization and cascading rationalization. Our system handles integrands that CAS systems cannot solve while guaranteeing correctness of all returned results.
+We present a hybrid system for symbolic integration that tries SymPy first, then falls back to a 44.8M-parameter Transformer whose outputs are verified by differentiation. Since differentiation is cheap and exact, we can sample 25 diverse candidates and accept the first one that checks out, giving a success probability of $1 - (1 - p)^N$. We also introduce depth-encoded structural features, grammar-constrained decoding, and a two-phase constant solver. The full pipeline reaches 79.3\% solve rate on our test set, up from 68.7\% with SymPy alone, and every returned result is guaranteed correct.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -34,41 +34,27 @@ symbolic integration, transformer, verification oracle, constrained decoding, co
 
 \section{Introduction}
 
-Symbolic integration---finding a closed-form antiderivative $F(x)$ such that $dF/dx = f(x)$ for a given integrand $f$---is among the oldest and most practically important tasks in mathematical reasoning. Computer algebra systems such as SymPy, Mathematica, and Maple implement variants of the Risch algorithm \cite{b28} and heuristic pattern matching to solve a broad class of integration problems. Yet these systems regularly fail on deeply nested compositions, certain special-function integrands, and expressions outside their built-in rule databases \cite{b24}.
+Symbolic integration is about finding a closed-form antiderivative $F(x)$ such that $dF/dx = f(x)$. Computer algebra systems like SymPy and Mathematica use variants of the Risch algorithm \cite{b28} and pattern matching to handle a wide range of integrals, but they regularly choke on deeply nested compositions and expressions outside their rule databases \cite{b24}.
 
-Neural approaches to symbolic mathematics, pioneered by Lample and Charton \cite{b19}, reformulate integration as sequence-to-sequence translation: the integrand is serialized in prefix notation, and a Transformer generates the antiderivative token by token. Their work demonstrated that seq2seq models can match or exceed CAS systems on integration benchmarks, achieving accuracy above 95\% on their test sets. However, pure neural approaches produce unverified outputs---a predicted antiderivative may be syntactically plausible but mathematically incorrect.
+Neural approaches, starting with Lample and Charton \cite{b19}, treat integration as sequence-to-sequence translation: serialize the integrand in prefix notation, have a Transformer generate the antiderivative token by token. This works surprisingly well (over 95\% on their benchmarks), but the outputs are unverified. A predicted antiderivative might look right but be mathematically wrong.
 
-\textbf{Key insight.} Integration possesses a property that distinguishes it from most generative tasks: a \textit{perfect verification oracle} exists. Differentiation is computationally cheap, always terminates, and is exact. Given a candidate antiderivative $\hat{F}(x)$, one can verify whether $\frac{d}{dx}\hat{F}(x) = f(x)$ with mathematical certainty. This asymmetry---hard to solve, easy to verify---means that the sampling-with-verification paradigm applies with formal guarantees rather than the statistical approximation of majority voting used in self-consistency methods \cite{b33}.
+The thing that makes integration special is that there is a perfect verification oracle. Differentiation is fast, always terminates, and is exact. Given a candidate $\hat{F}(x)$, you just check whether $\frac{d}{dx}\hat{F}(x) = f(x)$. This is fundamentally different from majority-voting approaches like self-consistency \cite{b33} where the verifier is approximate. With differentiation, a single correct candidate out of $N$ is enough. If each sample is correct with probability $p$, then $N$ independent samples give you $P(\text{success}) = 1 - (1 - p)^N$. Even with $p = 0.6$ and $N = 25$, that exceeds 99.99\%. So instead of trying to make each individual prediction better, we just generate a bunch of diverse candidates and verify them.
 
-With a perfect verifier, candidate diversity matters more than per-candidate quality. If each independent sample has accuracy $p$, then $N$ independent samples yield a pipeline success probability of $1 - (1 - p)^N$. For $p = 0.6$ and $N = 25$, this exceeds 99.99\%.
+Our system has four main contributions. First, we build a two-stage pipeline where SymPy gets the first shot (4s timeout), and the Transformer only runs if SymPy fails. We use temperature sampling ($N = 25$, $T = 0.7$, top-$p = 0.95$) as the primary inference strategy. Second, we introduce 608-dimensional depth-encoded structural features ($76$ function heads $\times$ 8 logarithmic depth bins) with a three-way power classification that distinguishes polynomial power ($x^2$), exponential ($2^x$), and tower ($x^x$) forms. These get injected into the encoder as a learned \texttt{[FEAT]} token. Third, we implement grammar-constrained decoding via prefix-notation arity stack tracking, which prevents the model from generating syntactically invalid sequences and wastes fewer sample slots. Fourth, we have a two-phase constant resolution pipeline that first tries symbolic solve (3s), then falls back to Sobol quasi-random numeric optimization with L-BFGS-B and cascading rationalization.
 
-We make the following contributions:
-
-\begin{itemize}
-\item \textbf{(C1)} A two-stage CAS-first, ML-fallback pipeline with differentiation-based verification. We employ temperature sampling ($N = 25$, $T = 0.7$, top-$p = 0.95$) as the primary inference strategy, achieving near-certain pipeline success.
-
-\item \textbf{(C2)} 608-dimensional depth-encoded structural features ($76$ function heads $\times$ 8 logarithmic depth bins) with a three-way power classification distinguishing polynomial power ($x^2$), exponential ($2^x$), and tower ($x^x$) forms. These features are injected into the encoder via a learned \texttt{[FEAT]} token.
-
-\item \textbf{(C3)} Grammar-constrained autoregressive decoding via prefix-notation arity stack tracking (\texttt{PrefixGrammarMask}), which eliminates syntactically invalid candidates and increases the effective pool of usable samples.
-
-\item \textbf{(C4)} A two-phase constant resolution pipeline that resolves template constants ($C_1, C_2, \ldots$) via symbolic solve (3s timeout) with fallback to Sobol quasi-random numeric optimization, multi-start L-BFGS-B, and cascading rationalization with mathematical constant hints.
-\end{itemize}
-
-The remainder of this paper is organized as follows. Section~II describes the representation of mathematical expressions as token sequences. Section~III details our data generation pipeline. Section~IV presents the method, including the model architecture and inference strategy. Section~V reports experimental results. Section~VI provides analysis and discussion of limitations. Section~VII surveys related work. Section~VIII concludes.
+The rest of the paper is organized as follows. Section~II covers how we represent expressions as token sequences. Section~III describes data generation. Section~IV presents the method. Section~V has experimental results. Section~VI discusses limitations and analysis. Section~VII concludes.
 
 \section{Expressions as Sequences}
 
-We follow the prefix (Polish) notation encoding introduced by Lample and Charton \cite{b19}, where mathematical expressions are serialized as unambiguous token sequences derived from their abstract syntax trees (ASTs).
+We use the prefix (Polish) notation encoding from Lample and Charton \cite{b19}, where expressions are serialized as token sequences from their abstract syntax trees.
 
 \subsection{Prefix Notation}
 
-An expression tree has operators at internal nodes and operands (variables, constants, integers) at leaves. Serialization proceeds by a pre-order traversal: operators are emitted before their arguments. Binary operators (Add, Mul, Pow) emit two arguments; unary operators (sin, cos, exp, log, etc.) emit one. N-ary operators are serialized as right-nested binary operations: $\text{Add}(a, b, c)$ becomes \texttt{[Add, a, Add, b, c]}.
-
-This encoding is lossless, deterministic, and unambiguous without the need for parentheses. Every valid prefix sequence corresponds to exactly one expression tree.
+An expression tree has operators at internal nodes and operands at leaves. We do a pre-order traversal: operators come before their arguments. Binary operators (Add, Mul, Pow) take two arguments, unary ones (sin, cos, exp, log) take one. N-ary operators get serialized as nested binary operations, so $\text{Add}(a, b, c)$ becomes \texttt{[Add, a, Add, b, c]}. This encoding is lossless and unambiguous without needing parentheses.
 
 \subsection{Base-100 Integer Tokenization}
 
-We introduce a compact integer representation that reduces token count for numeric subexpressions. Integers are encoded in base-100 with a sign marker prefix:
+We use a compact integer representation where integers are encoded in base-100 with a sign prefix:
 
 \begin{table}[htbp]
 \caption{Base-100 integer encoding examples.}
@@ -90,21 +76,21 @@ $-7$ & \texttt{INT$-$ 07} & 2 \\
 \end{center}
 \end{table}
 
-Decoding applies base-100 arithmetic: $\text{val} = \text{val} \times 100 + \text{chunk}$. This replaces Lample and Charton's digit-by-digit encoding, where 123456 would require 7 tokens (\texttt{INT+ 1 2 3 4 5 6}). Rational numbers are encoded as \texttt{[Rational, INT+\_p, INT+\_q]} where $p/q$ is the fraction in lowest terms.
+Decoding is just $\text{val} = \text{val} \times 100 + \text{chunk}$. This replaces the digit-by-digit encoding from \cite{b19} where 123456 would need 7 tokens. Rationals are encoded as \texttt{[Rational, INT+\_p, INT+\_q]} where $p/q$ is in lowest terms.
 
 \subsection{Vocabulary}
 
-The sequence vocabulary consists of 204 tokens: special tokens (4: PAD, BOS, EOS, UNK), sign markers (2: INT+, INT$-$), constant placeholders (20: $C_1$ through $C_{20}$), operators and functions (78: including standard trigonometric, inverse trigonometric, hyperbolic, exponential, logarithmic, special functions, structural operators, and symbols), and base-100 number tokens (100: digits 0--99). The feature vocabulary defines 76 function heads used for structural feature extraction (Section~IV-B).
+The sequence vocabulary has 204 tokens: 4 special tokens (PAD, BOS, EOS, UNK), 2 sign markers, 20 constant placeholders ($C_1$ through $C_{20}$), 78 operators and functions (trig, hyperbolic, special functions, structural operators, symbols), and 100 base-100 digit tokens. The feature vocabulary defines 76 function heads for structural feature extraction (Section~IV-B).
 
 \section{Generating Training Data}
 
-Following Lample and Charton \cite{b19}, we rely primarily on backward generation to produce verified integrand--antiderivative pairs at scale. We supplement this with a curated dataset (SIRD) and expression augmentation.
+Following \cite{b19}, we primarily use backward generation to produce verified integrand-antiderivative pairs. We supplement this with a curated dataset and augmentation.
 
-\textbf{Backward generation.} We generate random expression trees $F(x)$ at configurable depth, then differentiate to obtain $f(x) = dF/dx$. Since differentiation always succeeds and is fast, this produces verified pairs by construction. We support three difficulty tiers: easy (depth 1--2), medium (3--4), and hard (5--6). The operator set includes sin, cos, tan, exp, log, sqrt, asin, acos, atan, sinh, cosh, tanh, Add, Mul, and Pow. Domain guards ensure well-defined expressions: logarithms wrap their argument in $|\text{child}| + 1$, square roots compose with $\text{child}^2 + 1$, and inverse trigonometric functions compose with bounded inputs. Coefficients are drawn from integers in $[-10, 10] \setminus \{0\}$ and rationals $\{1/2, 1/3, \ldots, 5/2, -1/2, \ldots\}$. Expressions are simplified via \texttt{nsimplify(cancel(expand(F)))}, and pairs are deduplicated by SHA-256 hash.
+\textbf{Backward generation.} We generate random expression trees $F(x)$ at configurable depth, differentiate to get $f(x) = dF/dx$, and since differentiation always works, we get verified pairs for free. We have three difficulty tiers: easy (depth 1-2), medium (3-4), and hard (5-6). The operator set covers trig, hyperbolic, exp, log, sqrt, and basic arithmetic. Domain guards keep things well-defined: logarithms wrap their argument in $|\text{child}| + 1$, square roots compose with $\text{child}^2 + 1$, and inverse trig functions get bounded inputs. Coefficients come from integers in $[-10, 10] \setminus \{0\}$ and simple rationals. Everything gets simplified and deduplicated by hash.
 
-\textbf{SIRD dataset processing.} We process the SIRD dataset containing approximately 2.1 million integrand records. Each integrand is integrated with SymPy using a 10-second timeout. Results are verified by differentiation, and expressions producing residual \texttt{Integral} or \texttt{Piecewise} terms are rejected. After tokenization and sequence length filtering (input $\leq$ 382, output $\leq$ 254 tokens), approximately 180,000 verified pairs remain---a yield of roughly 9\%.
+\textbf{SIRD dataset processing.} We also process the SIRD dataset with about 2.1 million integrand records. Each one gets integrated with SymPy (10s timeout), verified by differentiation, and filtered for residual \texttt{Integral} or \texttt{Piecewise} terms. After tokenization and length filtering (input $\leq$ 382, output $\leq$ 254 tokens), roughly 180,000 verified pairs survive, about a 9\% yield.
 
-\textbf{Expression augmentation.} We apply three augmentation strategies that preserve mathematical equivalence: (1)~commutativity permutation of commutative operators, (2)~expand/factor rewriting, and (3)~trigonometric rewriting. All variants share the same target antiderivative. Augmentation produces a 3--4$\times$ effective dataset multiplier.
+\textbf{Expression augmentation.} We apply three augmentation strategies that preserve mathematical equivalence: commutativity permutation, expand/factor rewriting, and trigonometric rewriting. All variants share the same target antiderivative, giving us a 3-4$\times$ effective dataset multiplier.
 
 \begin{table}[htbp]
 \caption{Dataset statistics.}
@@ -122,43 +108,33 @@ Backward & configurable & configurable & $>$95\% \\
 \end{center}
 \end{table}
 
-Data is split 80/10/10 into train/validation/test sets, stratified by input sequence length. Each split is sharded into gzipped JSONL files containing 10,000 pairs per shard.
+Data is split 80/10/10 into train/validation/test, stratified by input sequence length. Each split is sharded into gzipped JSONL files with 10,000 pairs per shard.
 
 \section{Method}
 
 \subsection{System Overview}
 
-Our system implements a two-stage integration pipeline (Fig.~\ref{fig:pipeline}). Given an input expression string, Stage~1 attempts CAS integration via SymPy with a 4-second timeout. If SymPy succeeds and the result does not contain residual \texttt{Integral} or \texttt{Piecewise} terms, the system returns the verified result immediately. If Stage~1 fails or times out, Stage~2 invokes the Transformer model with a 15-second timeout. The ML stage tokenizes the integrand, extracts structural features, and generates candidate antiderivatives. Each candidate is verified by symbolic differentiation. The maximum end-to-end latency is 19 seconds ($4 + 15$).
+The system is a two-stage pipeline (Fig.~\ref{fig:pipeline}). Stage~1 tries SymPy with a 4-second timeout. If it works and the result is clean (no leftover \texttt{Integral} or \texttt{Piecewise} terms), we return it. If not, Stage~2 kicks in with the Transformer (15s timeout). The ML stage tokenizes the integrand, extracts structural features, generates candidates, and verifies each one by differentiation. Worst case end-to-end latency is 19 seconds.
 
-SymPy integration runs in a persistent \texttt{ProcessPoolExecutor} (one worker) for reliable timeout enforcement. The ML stage runs in a \texttt{ThreadPoolExecutor} to share GPU memory.
+SymPy runs in a persistent \texttt{ProcessPoolExecutor} so we can reliably kill it on timeout. The ML stage uses a \texttt{ThreadPoolExecutor} to share GPU memory.
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_pipeline.png}}
-\caption{Two-stage integration pipeline. Stage~1 (green) attempts CAS integration. Stage~2 (blue) generates Transformer candidates verified by differentiation (orange). Maximum latency: 19 seconds.}
+\caption{Two-stage integration pipeline. Stage~1 (green) tries CAS integration. Stage~2 (blue) generates Transformer candidates verified by differentiation (orange). Max latency: 19s.}
 \label{fig:pipeline}
 \end{figure}
 
 \subsection{Depth-Encoded Structural Features}
 
-Prefix token sequences lose information about composition depth and structural nesting. A shallow expression like $\sin(x) + \cos(x)$ and a deeply nested one like $\sin(\cos(\exp(\log(x))))$ may have similar token-level statistics but require fundamentally different integration strategies.
+Prefix sequences lose depth information. A shallow expression like $\sin(x) + \cos(x)$ and a deeply nested one like $\sin(\cos(\exp(\log(x))))$ look similar at the token level but need completely different integration strategies.
 
-We address this with a 608-dimensional feature vector computed by a depth-first walk of the SymPy expression tree, recording which function heads appear at which nesting depths relative to the integration variable.
+We fix this with a 608-dimensional feature vector computed by walking the SymPy expression tree depth-first and recording which function heads show up at which nesting depths.
 
-\textbf{Feature vocabulary.} We define 76 function heads covering standard trigonometric functions (12), inverse trigonometric (12), hyperbolic (12), inverse hyperbolic (12), exponential and logarithmic (5), special functions, structural operators, and numeric types. Critically, we introduce a three-way power classification:
+\textbf{Feature vocabulary.} We define 76 function heads covering trig (12), inverse trig (12), hyperbolic (12), inverse hyperbolic (12), exp and log (5), special functions, structural operators, and numeric types. The key innovation is a three-way power classification: \textbf{Pow} means the variable is only in the base (like $x^2$), \textbf{Exp} means it is only in the exponent (like $2^x$), and \textbf{Tower} means it is in both (like $x^x$). These three cases need fundamentally different integration approaches.
 
-\begin{itemize}
-\item \textbf{Pow}: Variable appears only in the base (e.g., $x^2$, $\sin(x)^3$)
-\item \textbf{Exp}: Variable appears only in the exponent (e.g., $2^x$, $e^x$, $3^{x^2}$)
-\item \textbf{Tower}: Variable appears in both base and exponent (e.g., $x^x$, $\sin(x)^{\cos(x)}$)
-\end{itemize}
+\textbf{Logarithmic depth binning.} Instead of recording exact depths, we bin into 8 logarithmic buckets with boundaries at $\{1, 2, 3, 4, 6, 9, 15\}$. Depths 1-4 get individual bins; deeper levels are grouped.
 
-These three cases require fundamentally different integration techniques---polynomial, exponential, and tetration strategies, respectively.
-
-\textbf{Logarithmic depth binning.} Rather than recording exact depths, we bin into 8 logarithmic buckets with boundaries at $\{1, 2, 3, 4, 6, 9, 15\}$. Depths 1--4 each receive an individual bin; deeper levels are grouped progressively.
-
-\textbf{Injection.} The feature vector is projected via a learned linear layer ($608 \rightarrow 512$) and prepended to the encoder input as a \texttt{[FEAT]} token, providing the Transformer with a structural summary of the integrand.
-
-\textbf{Schema hashing.} A SHA-256 hash of the ordered head names, head indices, and number of depth bins is computed and stored in each checkpoint. This detects incompatible feature schema changes at model load time.
+\textbf{Injection.} The feature vector goes through a learned linear layer ($608 \rightarrow 512$) and gets prepended to the encoder input as a \texttt{[FEAT]} token. We also store a SHA-256 hash of the feature schema in each checkpoint so we can detect incompatible changes at load time.
 
 \subsection{Model Architecture}
 
@@ -200,29 +176,25 @@ Max output length & 256 tokens \\
 \end{center}
 \end{table}
 
-\textbf{Encoder.} The input token sequence is embedded and scaled by $\sqrt{d_\text{model}}$. The 608-dimensional feature vector is projected to $d_\text{model}$ via a linear layer and prepended as a \texttt{[FEAT]} token. Sinusoidal positional encodings are applied, followed by 6 pre-norm Transformer encoder layers with self-attention and padding masks.
+\textbf{Encoder.} Input tokens are embedded and scaled by $\sqrt{d_\text{model}}$. The 608-dim feature vector gets projected to $d_\text{model}$ and prepended as a \texttt{[FEAT]} token. Then sinusoidal positional encodings and 6 pre-norm encoder layers with self-attention.
 
-\textbf{Decoder.} Target tokens are embedded, scaled, and positionally encoded. Six pre-norm Transformer decoder layers apply causal (triangular) self-attention masks and cross-attention to encoder memory. A final linear projection maps to vocabulary logits.
+\textbf{Decoder.} Target tokens are embedded, scaled, and positionally encoded. Six pre-norm decoder layers apply causal self-attention and cross-attention to encoder memory. A final linear projection gives vocabulary logits.
 
-\textbf{Training.} We use Adam ($\beta_1 = 0.9$, $\beta_2 = 0.98$, $\varepsilon = 10^{-9}$) with gradient clipping (max\_norm = 1.0). The learning rate follows a warmup-then-inverse-square-root schedule:
+\textbf{Training.} We use Adam ($\beta_1 = 0.9$, $\beta_2 = 0.98$, $\varepsilon = 10^{-9}$) with gradient clipping (max\_norm = 1.0). Learning rate follows warmup-then-inverse-square-root:
 \begin{equation}
 \text{lr}(t) = \text{lr}_\text{base} \cdot \min\!\left(\frac{t}{t_\text{warmup}},\; \sqrt{\frac{t_\text{warmup}}{t}}\right)
 \end{equation}
-with $\text{lr}_\text{base} = 4 \times 10^{-5}$ and $t_\text{warmup} = 4{,}000$ steps. The loss is cross-entropy with inverse-frequency class weights (capped at 10.0), excluding PAD tokens. Training runs for up to 50 epochs with early stopping (patience 5) on exact sequence match.
-
-Following Izmailov et al. \cite{b17}, we average the state dictionaries of the last $K = 5$ epoch checkpoints (stochastic weight averaging), which yields a consistent +1--2\% accuracy improvement with no additional training.
+with $\text{lr}_\text{base} = 4 \times 10^{-5}$ and $t_\text{warmup} = 4{,}000$ steps. Loss is cross-entropy with inverse-frequency class weights (capped at 10.0), ignoring PAD tokens. We train up to 50 epochs with early stopping (patience 5) on exact match. Following Izmailov et al. \cite{b17}, we average the last $K = 5$ epoch checkpoints (SWA), which gives a consistent +1-2\% accuracy boost for free.
 
 \subsection{Sampling with a Verification Oracle}
 
-The central design principle of our inference strategy exploits the asymmetry between integration (hard) and differentiation (easy). Given a candidate antiderivative $\hat{F}(x)$, verification reduces to checking whether $\text{simplify}(\frac{d}{dx}\hat{F}(x) - f(x)) = 0$---a computation that is fast, deterministic, and exact.
-
-\textbf{Theoretical analysis.} With a perfect verifier, any correct candidate among $N$ samples suffices. If each sample is independently correct with probability $p$, then:
+The whole inference strategy is built around the fact that integration is hard but differentiation is easy. Given a candidate $\hat{F}(x)$, we just check if $\text{simplify}(\frac{d}{dx}\hat{F}(x) - f(x)) = 0$. This is fast, deterministic, and exact. With a perfect verifier, any correct candidate among $N$ samples is enough:
 \begin{equation}
 P(\text{pipeline success}) = 1 - (1 - p)^N
 \label{eq:sampling}
 \end{equation}
 
-This is qualitatively different from majority-voting self-consistency \cite{b33}, where the verifier is approximate and the guarantee is statistical. With differentiation, a single correct sample among $N$ is sufficient.
+This is not like majority voting where you need most samples to agree. Here, one correct sample out of 25 is sufficient.
 
 \begin{table}[htbp]
 \caption{Sampling success probability as a function of per-sample accuracy $p$ and number of samples $N$.}
@@ -246,25 +218,15 @@ This is qualitatively different from majority-voting self-consistency \cite{b33}
 \end{center}
 \end{table}
 
-\textbf{Primary strategy: temperature sampling.} We generate 25 candidate sequences using temperature sampling ($T = 0.7$) with nucleus filtering (top-$p = 0.95$), batched in groups of 5. At each decoding step, logits are divided by $T$, sorted by probability, and filtered to retain only tokens whose cumulative softmax probability does not exceed 0.95 \cite{b16}. Each candidate is immediately verified by differentiation; the first verified result is returned. If a candidate contains template constants ($C_1, C_2, \ldots$), it is routed through the constant solver (Section~IV-F) before verification.
+\textbf{Primary strategy: temperature sampling.} We generate 25 candidates with temperature $T = 0.7$ and nucleus filtering (top-$p = 0.95$) \cite{b16}, batched in groups of 5. Each candidate is verified immediately; the first one that passes gets returned. If a candidate has template constants ($C_1, C_2, \ldots$), it goes through the constant solver first (Section~IV-F).
 
-\textbf{Fallback: beam search.} If no temperature sample verifies, we generate 10 candidates via beam search with Wu et al. \cite{b35} length penalty: $\text{score}(y) = \log P(y) / ((5 + |y|) / 6)^\alpha$, where $\alpha = 0.7$.
+\textbf{Fallback: beam search.} If none of the 25 samples verify, we try beam search (width 10) with length penalty \cite{b35}: $\text{score}(y) = \log P(y) / ((5 + |y|) / 6)^\alpha$, $\alpha = 0.7$.
 
 \subsection{Grammar-Constrained Decoding}
 
-Unconstrained autoregressive decoding can produce syntactically invalid prefix sequences---for example, a binary operator followed by EOS before its second argument is generated. Such candidates waste beam or sample slots.
+Unconstrained decoding can produce syntactically invalid prefix sequences, like a binary operator followed by EOS before its second argument. These waste sample slots.
 
-We implement a \texttt{PrefixGrammarMask} that tracks the arity stack during generation and returns a boolean mask of valid next tokens at each decoding step. The rules are:
-
-\begin{enumerate}
-\item \textbf{Binary operators} (Add, Mul, Pow, Rational, etc.): increment the ``need'' counter by +1.
-\item \textbf{Unary operators} (sin, cos, exp, Neg, etc.): no change to need counter.
-\item \textbf{Terminals} ($x$, $\pi$, $e$, $i$, $C_1$--$C_{20}$): decrement need counter by 1.
-\item \textbf{INT+/INT$-$}: enter integer mode; at least one number token must follow.
-\item \textbf{EOS}: valid only when the need counter equals 0.
-\end{enumerate}
-
-This mask is applied to logits before softmax during both sampling and beam search, setting invalid token logits to $-\infty$.
+We implement a \texttt{PrefixGrammarMask} that tracks the arity stack during generation and masks out invalid next tokens. Binary operators (Add, Mul, Pow) increment the ``need'' counter by 1. Unary operators (sin, cos, exp) leave it unchanged. Terminals ($x$, $\pi$, constants) decrement it by 1. Integer sign tokens (INT+/INT$-$) enter a special mode where at least one digit must follow. EOS is only valid when need equals 0. The mask sets invalid logits to $-\infty$ before softmax.
 
 \begin{figure}[htbp]
 \begin{center}
@@ -288,31 +250,31 @@ This mask is applied to logits before softmax during both sampling and beam sear
 \hline
 7 & 2 & 0 & Numbers or EOS \\
 \hline
-8 & EOS & --- & (complete) \\
+8 & EOS & -- & (complete) \\
 \hline
 \end{tabular}
 \end{center}
-\caption{Grammar-constrained decoding trace for generating \texttt{Add sin x Pow x INT+ 2}. At each step, the grammar mask restricts the token space to syntactically valid continuations.}
+\caption{Grammar-constrained decoding trace for \texttt{Add sin x Pow x INT+ 2}. The grammar mask restricts each step to syntactically valid continuations.}
 \label{fig:grammar}
 \end{figure}
 
 \subsection{Two-Phase Constant Resolution}
 
-The Transformer may predict antiderivative templates containing placeholder constants $C_1, C_2, \ldots, C_{20}$. The constant solver determines the values of these constants such that differentiation of the filled template reproduces the original integrand.
+The Transformer sometimes predicts templates with placeholder constants $C_1, C_2, \ldots$ that need to be resolved. For example, given integrand $\sin(x)$, it might predict $C_1 \cdot \cos(x) + C_2$.
 
-\textbf{Phase~1: symbolic solve (3-second timeout).} The template is differentiated symbolically, and the resulting equation $dT/dx = f(x)$ is passed to SymPy's \texttt{solve()} for the unknown constants.
+Phase~1 is symbolic solve with a 3-second timeout. We differentiate the template and pass $dT/dx = f(x)$ to SymPy's \texttt{solve()}.
 
-\textbf{Phase~2: numeric solve (10-second timeout).} When symbolic solving fails, we fall back to numeric optimization: (1)~Sobol quasi-random sampling generates evaluation points on $[-10, 10]$ using scrambled Sobol sequences; (2)~70/30 train/verify split; (3)~multi-start L-BFGS-B (3 restarts) minimizing mean squared error between $dT/dx$ and $f(x)$; (4)~acceptance criteria: train MSE $\leq 10^{-6}$ and verification max error $\leq 10^{-4}$; (5)~cascading rationalization via \texttt{nsimplify()} with mathematical constant hints ($\pi$, $e$, $\sqrt{2}$, $\sqrt{3}$, $\log 2$, $\varphi$) at tolerances $[10^{-10}, 10^{-8}, 10^{-6}]$; (6)~final verification by symbolic differentiation.
+Phase~2 kicks in when symbolic solve fails. We generate evaluation points on $[-10, 10]$ using scrambled Sobol sequences, split them 70/30 into train and verify sets, and run multi-start L-BFGS-B (3 restarts) to minimize the MSE between $dT/dx$ and $f(x)$. A solution is accepted if train MSE $\leq 10^{-6}$ and verification max error $\leq 10^{-4}$. Then we rationalize each numeric constant using \texttt{nsimplify()} with hints ($\pi$, $e$, $\sqrt{2}$, $\sqrt{3}$, $\log 2$, $\varphi$) at tolerances $[10^{-10}, 10^{-8}, 10^{-6}]$. The final filled template is verified by differentiation.
 
 \section{Experiments}
 
 \subsection{Setup}
 
-\textbf{Data.} We train on a combined dataset of backward-generated pairs and processed SIRD pairs. The test set is held out from the combined data (10\% stratified split). We evaluate on both the standard test set and a per-difficulty-tier breakdown.
+\textbf{Data.} We train on backward-generated pairs combined with processed SIRD pairs. The test set is a 10\% stratified holdout. We evaluate per-difficulty-tier and overall.
 
-\textbf{Metrics.} We report: solve rate (fraction of integrands for which the system returns a verified result), token accuracy (per-token accuracy under teacher forcing), exact match (fraction where greedy decoding exactly matches the ground truth), and latency (wall-clock time per integral).
+\textbf{Metrics.} We report solve rate (fraction returning a verified result), token accuracy (per-token under teacher forcing), exact match (greedy decoding matches ground truth), and latency.
 
-\textbf{Baselines.} We compare: (1)~SymPy-only with 60-second timeout, (2)~Transformer + beam search (width~10), (3)~Transformer + sampling ($N = 25$), and (4)~the full two-stage pipeline.
+\textbf{Baselines.} We compare four configurations: SymPy-only with 60s timeout, Transformer + beam search (width 10), Transformer + sampling ($N = 25$), and the full two-stage pipeline. Neural methods report mean $\pm$ std over 5 seeds.
 
 \subsection{Main Results}
 
@@ -336,7 +298,7 @@ Trans. + samp. & 91.5\footnotesize{$\pm$0.7} & 68.0\footnotesize{$\pm$1.3} & 41.
 \end{center}
 \end{table}
 
-Bold indicates best result per column. SymPy-only is deterministic; neural methods report mean $\pm$ std over 5 seeds. The full pipeline achieves 79.3\% overall solve rate, a 10.6 percentage point improvement over SymPy-only, by adding ML fallback for integrands that the CAS cannot handle.
+The full pipeline hits 79.3\% overall, a 10.6 point improvement over SymPy alone. The gain comes from the ML fallback catching integrands that the CAS cannot handle. Sampling clearly beats beam search (67.0\% vs 54.5\%), which makes sense given the verification oracle.
 
 \subsection{Ablation Study}
 
@@ -366,11 +328,11 @@ $-$ Base-100 & 76.4\footnotesize{$\pm$1.1} & 69.7\footnotesize{$\pm$0.8} & 61.5\
 \end{center}
 \end{table}
 
-Removing depth features causes the largest degradation ($-5.1$ pp solve rate), followed by the numeric constant solver ($-5.8$ pp) and augmentation ($-3.7$ pp). The grammar mask contributes $-2.5$ pp, confirming that syntactic filtering improves sample efficiency. Checkpoint averaging (SWA) provides a modest but consistent $+2.2$ pp gain at zero training cost. Base-100 encoding contributes $+2.9$ pp over digit-by-digit tokenization.
+The biggest hits come from removing depth features ($-5.1$ pp) and the numeric constant solver ($-5.8$ pp). Augmentation accounts for $-3.7$ pp and grammar masking for $-2.5$ pp. SWA gives +2.2 pp at zero cost. Base-100 encoding is worth +2.9 pp over digit-by-digit.
 
 \subsection{Sampling Analysis}
 
-We measure the empirical per-sample accuracy $p$ and compare the observed pipeline success rate against the theoretical prediction $1 - (1 - p)^N$.
+We measure the empirical per-sample accuracy $p$ and compare the observed success rate against the theoretical $1 - (1 - p)^N$.
 
 \begin{table}[htbp]
 \caption{Pipeline success rate (\%) as a function of samples $N$.}
@@ -396,11 +358,11 @@ We measure the empirical per-sample accuracy $p$ and compare the observed pipeli
 \end{center}
 \end{table}
 
-Theoretical values assume independent samples. The growing gap $\Delta$ at large $N$ reflects inter-sample correlation: temperature sampling does not produce fully independent samples, and systematic failures (e.g., integrands outside the training distribution) are shared across all samples.
+The theoretical values assume independent samples. The gap at large $N$ (especially $N = 50$) is from inter-sample correlation and systematic failures on out-of-distribution integrands.
 
 \subsection{Coverage Analysis}
 
-We categorize test integrands into four groups: (1)~solved by SymPy only (ML fails), (2)~solved by ML only (SymPy fails), (3)~solved by both, and (4)~solved by neither. This decomposition reveals the complementarity of the two stages: SymPy dominates on textbook integrands while the Transformer handles compositions and special-function combinations outside SymPy's scope.
+We split test integrands into four buckets: solved by SymPy only (ML fails), solved by ML only (SymPy fails), solved by both, and solved by neither. This shows how complementary the two stages are. SymPy dominates on textbook integrals while the Transformer picks up compositions and special-function combinations that SymPy cannot handle.
 
 \subsection{Latency Breakdown}
 
@@ -413,21 +375,21 @@ We categorize test integrands into four groups: (1)~solved by SymPy only (ML fai
 \hline
 SymPy integration & 4.0s & 0.087 & 1.24 & 3.61 \\
 \hline
-Tokenize + features & --- & 0.003 & 0.008 & 0.014 \\
+Tokenize + features & -- & 0.003 & 0.008 & 0.014 \\
 \hline
-Model encoding & --- & 0.012 & 0.019 & 0.024 \\
+Model encoding & -- & 0.012 & 0.019 & 0.024 \\
 \hline
-Sampling ($N$=25) & --- & 1.82 & 3.41 & 4.67 \\
+Sampling ($N$=25) & -- & 1.82 & 3.41 & 4.67 \\
 \hline
-Beam search ($b$=10) & --- & 0.94 & 1.73 & 2.31 \\
+Beam search ($b$=10) & -- & 0.94 & 1.73 & 2.31 \\
 \hline
 Const. solver (sym.) & 3.0s & 0.21 & 1.07 & 2.48 \\
 \hline
 Const. solver (num.) & 10.0s & 1.34 & 4.82 & 8.13 \\
 \hline
-E2E (SymPy success) & --- & 0.091 & 1.26 & 3.64 \\
+E2E (SymPy success) & -- & 0.091 & 1.26 & 3.64 \\
 \hline
-E2E (ML success) & --- & 2.94 & 7.18 & 12.4 \\
+E2E (ML success) & -- & 2.94 & 7.18 & 12.4 \\
 \hline
 E2E (failure) & 19.0s & 18.7 & 18.9 & 19.0 \\
 \hline
@@ -436,78 +398,38 @@ E2E (failure) & 19.0s & 18.7 & 18.9 & 19.0 \\
 \end{center}
 \end{table}
 
-Tokenization and feature extraction are negligible (3ms median). SymPy integration is fast when it succeeds (87ms median). The ML path is dominated by sampling (1.82s for 25 candidates) and constant solving (0.21--1.34s depending on phase). Failed integrals consume nearly the full 19-second budget.
+Tokenization and feature extraction are basically free (3ms). SymPy is fast when it works (87ms median). The ML path is mostly sampling (1.82s for 25 candidates) and constant solving. Failed integrals eat the full 19-second timeout.
 
 \section{Analysis and Discussion}
 
 \subsection{Error Analysis}
 
-We categorize failures into four modes: (1)~\textit{SymPy timeout}: the integrand is too complex for the CAS within the 4-second budget; (2)~\textit{No verified sample}: the Transformer generates 25 temperature samples and 10 beam candidates, but none satisfy the differentiation check; (3)~\textit{Constant solver failure}: a correct template structure is predicted, but the constants cannot be resolved within 13 seconds; (4)~\textit{Tokenization overflow}: the integrand or antiderivative exceeds the 382/254 token limit.
+Failures fall into four categories. SymPy timeout: the integrand is too gnarly for the CAS in 4 seconds. No verified sample: we generate 25 temperature samples and 10 beam candidates but none pass the differentiation check. Constant solver failure: we get the right template structure but cannot resolve the constants in 13 seconds. Tokenization overflow: the integrand or antiderivative is too long for our 382/254 token limits.
 
 \subsection{Limitations}
 
-Several limitations constrain the current system:
-
-\begin{itemize}
-\item \textbf{Single-variable integration only.} The system handles $\int f(x)\,dx$ for one variable $x$. Multivariate integration and definite integrals are not supported.
-\item \textbf{Verification depends on SymPy simplification.} A correct antiderivative may fail verification if SymPy cannot simplify $\frac{d}{dx}\hat{F}(x) - f(x)$ to zero. This creates false negatives (never false positives).
-\item \textbf{Token length bounds.} Expressions exceeding 384 input or 256 output tokens are rejected.
-\item \textbf{Model scale.} At $\sim$44.8M parameters, the model is relatively small by modern standards. Scaling behavior \cite{b26} remains unexplored.
-\end{itemize}
+The system only handles single-variable indefinite integrals. No multivariate or definite integrals. Verification depends on SymPy being able to simplify $\frac{d}{dx}\hat{F}(x) - f(x)$ to zero, which sometimes fails even when the answer is correct (false negatives, but never false positives). The 384/256 token limits exclude very long expressions. And at 44.8M parameters the model is on the small side; scaling behavior \cite{b26} remains unexplored.
 
 \subsection{Broader Applicability}
 
-The verify-then-diversify paradigm applies to any problem where: (1)~the task is hard (integration, equation solving, theorem proving), (2)~a cheap exact verifier exists (differentiation, substitution, formal proof checking), and (3)~diverse candidates can be generated efficiently (temperature sampling). The key architectural insight---invest compute in candidate diversity rather than per-candidate quality---inverts the conventional beam search wisdom.
-
-\section{Related Work}
-
-\textbf{Neural symbolic mathematics.} Lample and Charton \cite{b19} introduced the sequence-to-sequence approach to symbolic integration using Transformers with prefix notation encoding, achieving over 95\% accuracy. Their backward data generation technique forms the foundation of our data pipeline. Saxton et al. \cite{b29} established benchmark tasks for mathematical reasoning. d'Ascoli and Charton \cite{b8} explored asymmetric encoder-decoder architectures for symbolic regression. Kamienny et al. \cite{b18} extended neural symbolic regression to end-to-end prediction including numeric constants. Biggio et al. \cite{b4} introduced NESYMRES, scaling neural symbolic regression with set-based representations.
-
-Our system builds directly on Lample and Charton's prefix notation and backward generation but adds the hybrid CAS-ML pipeline, structural depth features, grammar-constrained decoding, and the sampling-with-verification inference strategy.
-
-\textbf{Verified and hybrid approaches.} Shojaee et al. \cite{b30} introduced TPSR, using Monte Carlo Tree Search-guided decoding for symbolic regression. Meidani et al. \cite{b22} proposed SNIP, a multimodal foundation model bridging symbolic and numeric representations (ICLR 2024 Spotlight). Barket et al. \cite{b2} trained classifiers to predict integration routine applicability. \"Unsal et al. \cite{b31} formulated integration as step-by-step proof search in AlphaIntegrator.
-
-Our approach differs from TPSR in using a perfect verifier and from AlphaIntegrator in predicting the antiderivative directly rather than searching over transformation sequences.
-
-\textbf{Sampling and verification.} Wang et al. \cite{b33} introduced self-consistency for chain-of-thought reasoning. Lightman et al. \cite{b21} demonstrated process reward models for mathematical problem solving. Polu and Sutskever \cite{b25} applied expert iteration with automated theorem provers, and Cobbe et al. \cite{b7} trained outcome-based verifiers for math word problems.
-
-Our work extends the sampling paradigm from approximate verification to exact verification. With a perfect oracle, the theoretical guarantee $1 - (1 - p)^N$ holds with mathematical certainty.
-
-\textbf{Constrained decoding.} Hokamp and Liu \cite{b15} introduced grid beam search for lexically constrained decoding. Scholak et al. \cite{b27} developed PICARD for parsing-based constrained decoding of SQL queries. Our \texttt{PrefixGrammarMask} applies a similar principle to prefix-notation mathematical expressions.
-
-\textbf{Structural features for tree data.} Tai et al. \cite{b31b} introduced Tree-LSTMs. Shiv and Quirk \cite{b30b} proposed tree-aware positional encodings. Alon et al. \cite{b1} used AST path features in code2seq. Our 608-dimensional depth feature vector is a lightweight alternative that preserves compatibility with standard Transformer implementations.
-
-\textbf{Classical integration.} Risch \cite{b28} provided the foundational algorithmic treatment of integration in finite terms. Moses \cite{b24} surveyed developments in computer algebra for integration.
+The verify-then-diversify idea works anywhere you have a hard generation task with a cheap exact verifier. That covers symbolic equation solving, identity verification, and formal theorem proving. The main takeaway is: when you have a perfect oracle, invest compute in candidate diversity rather than per-candidate quality. This flips the usual beam search thinking on its head.
 
 \section{Conclusion}
 
-We presented a hybrid CAS-Transformer system for symbolic integration that guarantees correctness of all returned results through differentiation-based verification. The central insight---that with a perfect oracle, candidate diversity trumps per-candidate quality---motivates our sampling-first inference strategy, where $N = 25$ temperature samples with $T = 0.7$ achieve near-certain pipeline success under modest per-sample accuracy. Supporting contributions include 608-dimensional depth-encoded structural features with three-way power classification, grammar-constrained prefix-notation decoding, and a two-phase constant resolution pipeline.
+We built a hybrid CAS-Transformer system for symbolic integration where every returned result is guaranteed correct by differentiation. The key idea is that with a perfect verifier, you want diverse candidates rather than individually better ones. Sampling 25 times with $T = 0.7$ works better than beam search because any single correct candidate is enough. The supporting pieces (depth features, grammar masking, constant solving) each contribute meaningfully, as shown in the ablation.
 
-The verify-then-diversify paradigm extends beyond integration to any task admitting a cheap exact verifier: symbolic equation solving, identity verification, and formal theorem proving. Future work includes tree-aware positional encodings \cite{b30b}, asymmetric encoder-decoder architectures \cite{b8}, self-training with the verification loop \cite{b25}, and model scaling studies \cite{b26}.
+Future work includes tree-aware positional encodings \cite{b30b}, asymmetric encoder-decoder architectures \cite{b8}, self-training with the verification loop \cite{b25}, and scaling the model up \cite{b26}.
 
 \begin{thebibliography}{00}
-\bibitem{b1} U. Alon, S. Brody, O. Levy, and E. Yahav, ``code2seq: Generating sequences from structured representations of code,'' in \textit{Proc. ICLR}, 2019.
-\bibitem{b2} R. Barket, U. Shafiq, M. England, and J. Gerhard, ``Transformers to predict the applicability of symbolic integration routines,'' in \textit{NeurIPS MATH-AI Workshop}, 2024.
-\bibitem{b4} L. Biggio, T. Bendinelli, A. Neitz, A. Lucchi, and G. Parascandolo, ``Neural symbolic regression that scales,'' in \textit{Proc. ICML}, pp. 936--945, 2021.
-\bibitem{b7} K. Cobbe et al., ``Training verifiers to solve math word problems,'' arXiv:2110.14168, 2021.
 \bibitem{b8} S. d'Ascoli, P.-A. Kamienny, G. Lample, and F. Charton, ``Deep symbolic regression for recurrent sequences,'' in \textit{Proc. ICML}, 2022.
-\bibitem{b15} C. Hokamp and Q. Liu, ``Lexically constrained decoding for sequence generation using grid beam search,'' in \textit{Proc. ACL}, pp. 1535--1546, 2017.
 \bibitem{b16} A. Holtzman, J. Buys, L. Du, M. Forbes, and Y. Choi, ``The curious case of neural text degeneration,'' in \textit{Proc. ICLR}, 2020.
 \bibitem{b17} P. Izmailov, D. Podoprikhin, T. Garipov, D. Vetrov, and A. G. Wilson, ``Averaging weights leads to wider optima and better generalization,'' in \textit{Proc. UAI}, 2018.
-\bibitem{b18} P.-A. Kamienny, S. d'Ascoli, G. Lample, and F. Charton, ``End-to-end symbolic regression with transformers,'' in \textit{NeurIPS}, 2022.
 \bibitem{b19} G. Lample and F. Charton, ``Deep learning for symbolic mathematics,'' in \textit{Proc. ICLR}, 2020.
-\bibitem{b21} H. Lightman et al., ``Let's verify step by step,'' in \textit{Proc. ICLR}, 2024.
-\bibitem{b22} K. Meidani, P. Shojaee, C. K. Reddy, and A. B. Farimani, ``SNIP: Bridging mathematical symbolic and numeric realms with unified pre-training,'' in \textit{Proc. ICLR (Spotlight)}, 2024.
 \bibitem{b24} J. Moses, ``Symbolic integration: The stormy decade,'' \textit{Communications of the ACM}, vol.~14, no.~8, pp. 548--560, 1971.
 \bibitem{b25} S. Polu and I. Sutskever, ``Generative language modeling for automated theorem proving,'' arXiv:2009.03393, 2020.
 \bibitem{b26} D. Otte, J. K. H. Franke, A. Zela, F. Ferreira, and F. Hutter, ``Towards scaling laws for symbolic regression,'' arXiv:2510.26064, 2025.
-\bibitem{b27} T. Scholak, N. Schucher, and D. Bahdanau, ``PICARD: Parsing incrementally for constrained auto-regressive decoding from language models,'' in \textit{Proc. EMNLP}, pp. 9895--9901, 2021.
 \bibitem{b28} R. H. Risch, ``The problem of integration in finite terms,'' \textit{Trans. Amer. Math. Soc.}, vol.~139, pp. 167--189, 1969.
-\bibitem{b29} D. Saxton, E. Grefenstette, F. Hill, and P. Kohli, ``Analysing mathematical reasoning abilities of neural models,'' in \textit{Proc. ICLR}, 2019.
-\bibitem{b30} P. Shojaee, K. Meidani, A. B. Farimani, and C. Reddy, ``Transformer-based planning for symbolic regression,'' in \textit{NeurIPS}, 2023.
 \bibitem{b30b} V. Shiv and C. Quirk, ``Novel positional encodings to enable tree-based transformers,'' in \textit{NeurIPS}, 2019.
-\bibitem{b31} M. \"Unsal, T. Gehr, and M. Vechev, ``AlphaIntegrator: Transformer action search for symbolic integration proofs,'' arXiv:2410.02666, 2024.
-\bibitem{b31b} K. S. Tai, R. Socher, and C. D. Manning, ``Improved semantic representations from tree-structured long short-term memory networks,'' in \textit{Proc. ACL}, pp. 1556--1566, 2015.
 \bibitem{b32} A. Vaswani et al., ``Attention is all you need,'' in \textit{NeurIPS}, 2017.
 \bibitem{b33} X. Wang et al., ``Self-consistency improves chain of thought reasoning in language models,'' in \textit{Proc. ICLR}, 2023.
 \bibitem{b34} R. Xiong et al., ``On layer normalization in the transformer architecture,'' in \textit{Proc. ICML}, 2020.
