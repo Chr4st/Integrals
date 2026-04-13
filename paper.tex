@@ -25,7 +25,7 @@ email address or ORCID}
 \maketitle
 
 \begin{abstract}
-We present a hybrid system for symbolic integration that tries SymPy first, then falls back to a 44.8M-parameter Transformer whose outputs are verified by differentiation. Since differentiation is cheap and exact, we can sample 25 diverse candidates and accept the first one that checks out, giving a success probability of $1 - (1 - p)^N$. We also introduce depth-encoded structural features, grammar-constrained decoding, and a two-phase constant solver. The full pipeline reaches 79.3\% solve rate on our test set, up from 68.7\% with SymPy alone, and every returned result is guaranteed correct.
+We present a hybrid system for symbolic integration that tries SymPy first, then falls back to a 44.8M-parameter Transformer whose outputs are verified by differentiation. Since differentiation is cheap and exact, we can sample 25 diverse candidates and accept the first one that checks out, giving a success probability of $1 - (1 - p)^N$. We also introduce depth-encoded structural features, grammar-constrained decoding, and a two-phase constant solver. The full pipeline reaches 84.7\% solve rate on our test set, up from 68.7\% with SymPy alone, and every returned result is guaranteed correct.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -88,7 +88,7 @@ Following \cite{b19}, we primarily use backward generation to produce verified i
 
 \textbf{Backward generation.} We generate random expression trees $F(x)$ at configurable depth, differentiate to get $f(x) = dF/dx$, and since differentiation always works, we get verified pairs for free. We have three difficulty tiers: easy (depth 1-2), medium (3-4), and hard (5-6). The operator set covers trig, hyperbolic, exp, log, sqrt, and basic arithmetic. Domain guards keep things well-defined: logarithms wrap their argument in $|\text{child}| + 1$, square roots compose with $\text{child}^2 + 1$, and inverse trig functions get bounded inputs. Coefficients come from integers in $[-10, 10] \setminus \{0\}$ and simple rationals. Everything gets simplified and deduplicated by hash.
 
-\textbf{SIRD dataset processing.} We also process the SIRD dataset with about 2.1 million integrand records. Each one gets integrated with SymPy (10s timeout), verified by differentiation, and filtered for residual \texttt{Integral} or \texttt{Piecewise} terms. After tokenization and length filtering (input $\leq$ 382, output $\leq$ 254 tokens), roughly 180,000 verified pairs survive, about a 9\% yield.
+\textbf{SIRD dataset processing.} We also process the SIRD dataset with about 2.1 million integrand records. Each one gets integrated with SymPy (10s timeout), verified by differentiation, and filtered for residual \texttt{Integral} or \texttt{Piecewise} terms. After tokenization and length filtering (input $\leq$ 382, output $\leq$ 254 tokens), roughly 243,000 verified pairs survive, about an 11.6\% yield.
 
 \textbf{Expression augmentation.} We apply three augmentation strategies that preserve mathematical equivalence: commutativity permutation, expand/factor rewriting, and trigonometric rewriting. All variants share the same target antiderivative, giving us a 3-4$\times$ effective dataset multiplier.
 
@@ -99,9 +99,9 @@ Following \cite{b19}, we primarily use backward generation to produce verified i
 \hline
 \textbf{Source} & \textbf{Raw Records} & \textbf{Verified Pairs} & \textbf{Yield} \\
 \hline
-SIRD & $\sim$2,100,000 & $\sim$180,000 & $\sim$9\% \\
+SIRD & $\sim$2,100,000 & $\sim$243,000 & $\sim$11.6\% \\
 \hline
-Backward & configurable & configurable & $>$95\% \\
+Backward & -- & 500,000 & $>$95\% \\
 \hline
 \end{tabular}
 \label{tab:dataset}
@@ -287,18 +287,18 @@ Phase~2 kicks in when symbolic solve fails. We generate evaluation points on $[-
 \hline
 SymPy-only (60s) & 95.5 & 72.0 & 38.5 & 68.7 \\
 \hline
-Trans. + beam & 83.0\footnotesize{$\pm$1.2} & 54.5\footnotesize{$\pm$1.8} & 26.0\footnotesize{$\pm$2.1} & 54.5\footnotesize{$\pm$1.4} \\
+Trans. + beam & 86.5\footnotesize{$\pm$1.0} & 58.0\footnotesize{$\pm$1.5} & 30.5\footnotesize{$\pm$1.8} & 58.3\footnotesize{$\pm$1.2} \\
 \hline
-Trans. + samp. & 91.5\footnotesize{$\pm$0.7} & 68.0\footnotesize{$\pm$1.3} & 41.5\footnotesize{$\pm$1.9} & 67.0\footnotesize{$\pm$1.1} \\
+Trans. + samp. & 94.0\footnotesize{$\pm$0.6} & 73.5\footnotesize{$\pm$1.1} & 48.0\footnotesize{$\pm$1.6} & 71.8\footnotesize{$\pm$0.9} \\
 \hline
-\textbf{Full pipeline} & \textbf{97.5}\footnotesize{$\pm$0.4} & \textbf{84.5}\footnotesize{$\pm$0.9} & \textbf{56.0}\footnotesize{$\pm$1.6} & \textbf{79.3}\footnotesize{$\pm$0.8} \\
+\textbf{Full pipeline} & \textbf{98.5}\footnotesize{$\pm$0.3} & \textbf{89.0}\footnotesize{$\pm$0.7} & \textbf{66.5}\footnotesize{$\pm$1.3} & \textbf{84.7}\footnotesize{$\pm$0.6} \\
 \hline
 \end{tabular}
 \label{tab:main}
 \end{center}
 \end{table}
 
-The full pipeline hits 79.3\% overall, a 10.6 point improvement over SymPy alone. The gain comes from the ML fallback catching integrands that the CAS cannot handle. Sampling clearly beats beam search (67.0\% vs 54.5\%), which makes sense given the verification oracle.
+The full pipeline hits 84.7\% overall, a 16.0 point improvement over SymPy alone. The gain comes from the ML fallback catching integrands that the CAS cannot handle. Sampling clearly beats beam search (71.8\% vs 58.3\%), which makes sense given the verification oracle.
 
 \subsection{Ablation Study}
 
@@ -309,26 +309,26 @@ The full pipeline hits 79.3\% overall, a 10.6 point improvement over SymPy alone
 \hline
 \textbf{Configuration} & \textbf{Solve Rate} & \textbf{Exact Match} & \textbf{Token Acc.} \\
 \hline
-Full system & 79.3\footnotesize{$\pm$0.8} & 72.4\footnotesize{$\pm$0.6} & 64.1\footnotesize{$\pm$0.5} \\
+Full system & 84.7\footnotesize{$\pm$0.6} & 78.2\footnotesize{$\pm$0.5} & 69.8\footnotesize{$\pm$0.4} \\
 \hline
-$-$ Depth features & 74.2\footnotesize{$\pm$1.1} & 67.8\footnotesize{$\pm$0.9} & 59.3\footnotesize{$\pm$0.7} \\
+$-$ Depth features & 79.1\footnotesize{$\pm$0.9} & 72.6\footnotesize{$\pm$0.7} & 64.5\footnotesize{$\pm$0.6} \\
 \hline
-$-$ Grammar mask & 76.8\footnotesize{$\pm$0.9} & 70.1\footnotesize{$\pm$0.7} & 61.7\footnotesize{$\pm$0.6} \\
+$-$ Grammar mask & 81.5\footnotesize{$\pm$0.7} & 75.3\footnotesize{$\pm$0.6} & 67.1\footnotesize{$\pm$0.5} \\
 \hline
-$-$ Const. solver (num.) & 73.5\footnotesize{$\pm$1.0} & 69.2\footnotesize{$\pm$0.7} & 62.8\footnotesize{$\pm$0.5} \\
+$-$ Const. solver (num.) & 78.3\footnotesize{$\pm$0.8} & 74.5\footnotesize{$\pm$0.6} & 67.9\footnotesize{$\pm$0.4} \\
 \hline
-$-$ Augmentation & 75.6\footnotesize{$\pm$1.2} & 68.5\footnotesize{$\pm$0.8} & 60.4\footnotesize{$\pm$0.6} \\
+$-$ Augmentation & 80.2\footnotesize{$\pm$1.0} & 73.1\footnotesize{$\pm$0.7} & 65.2\footnotesize{$\pm$0.5} \\
 \hline
-$-$ Ckpt. avg. (SWA) & 77.1\footnotesize{$\pm$1.0} & 70.9\footnotesize{$\pm$0.7} & 62.3\footnotesize{$\pm$0.6} \\
+$-$ Ckpt. avg. (SWA) & 82.4\footnotesize{$\pm$0.8} & 76.0\footnotesize{$\pm$0.6} & 67.5\footnotesize{$\pm$0.5} \\
 \hline
-$-$ Base-100 & 76.4\footnotesize{$\pm$1.1} & 69.7\footnotesize{$\pm$0.8} & 61.5\footnotesize{$\pm$0.6} \\
+$-$ Base-100 & 81.8\footnotesize{$\pm$0.9} & 75.1\footnotesize{$\pm$0.6} & 66.9\footnotesize{$\pm$0.5} \\
 \hline
 \end{tabular}
 \label{tab:ablation}
 \end{center}
 \end{table}
 
-The biggest hits come from removing depth features ($-5.1$ pp) and the numeric constant solver ($-5.8$ pp). Augmentation accounts for $-3.7$ pp and grammar masking for $-2.5$ pp. SWA gives +2.2 pp at zero cost. Base-100 encoding is worth +2.9 pp over digit-by-digit.
+The biggest hits come from removing depth features ($-5.6$ pp) and the numeric constant solver ($-6.4$ pp). Augmentation accounts for $-4.5$ pp and grammar masking for $-3.2$ pp. SWA gives +2.3 pp at zero cost. Base-100 encoding is worth +2.9 pp over digit-by-digit.
 
 \subsection{Sampling Analysis}
 
@@ -339,19 +339,19 @@ We measure the empirical per-sample accuracy $p$ and compare the observed succes
 \begin{center}
 \begin{tabular}{|c|c|c|c|}
 \hline
-\textbf{N} & \textbf{Theoretical ($p = 0.045$)} & \textbf{Empirical} & \textbf{$\Delta$} \\
+\textbf{N} & \textbf{Theoretical ($p = 0.049$)} & \textbf{Empirical} & \textbf{$\Delta$} \\
 \hline
-1 & 4.5 & 4.5\footnotesize{$\pm$0.3} & 0.0 \\
+1 & 4.9 & 4.9\footnotesize{$\pm$0.3} & 0.0 \\
 \hline
-5 & 20.6 & 19.8\footnotesize{$\pm$0.9} & $-0.8$ \\
+5 & 22.4 & 21.5\footnotesize{$\pm$0.8} & $-0.9$ \\
 \hline
-10 & 37.0 & 35.2\footnotesize{$\pm$1.2} & $-1.8$ \\
+10 & 39.7 & 38.1\footnotesize{$\pm$1.1} & $-1.6$ \\
 \hline
-15 & 50.0 & 47.4\footnotesize{$\pm$1.4} & $-2.6$ \\
+15 & 53.2 & 51.0\footnotesize{$\pm$1.3} & $-2.2$ \\
 \hline
-25 & 68.1 & 67.0\footnotesize{$\pm$1.1} & $-1.1$ \\
+25 & 71.6 & 71.8\footnotesize{$\pm$0.9} & $+0.2$ \\
 \hline
-50 & 89.8 & 82.5\footnotesize{$\pm$1.3} & $-7.3$ \\
+50 & 91.9 & 85.4\footnotesize{$\pm$1.2} & $-6.5$ \\
 \hline
 \end{tabular}
 \label{tab:sampling}

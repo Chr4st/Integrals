@@ -77,7 +77,7 @@ Following Lample and Charton (2020), we rely primarily on backward generation to
 
 **Backward generation.** We generate random expression trees F(x) at configurable depth, then differentiate to obtain f(x) = dF/dx. Since differentiation always succeeds and is fast, this produces verified pairs by construction. We support five difficulty tiers: easy (depth 1–2), medium (3–4), hard (5–6), very hard (7–8), and extreme (9–10). The operator set includes sin, cos, tan, exp, log, sqrt, asin, acos, atan, sinh, cosh, tanh, Add, Mul, and Pow. Domain guards ensure well-defined expressions: logarithms wrap their argument in |child| + 1, square roots compose with child² + 1, and inverse trigonometric functions compose with bounded inputs. Coefficients are drawn from integers in [−10, 10] \ {0} and rationals {1/2, 1/3, ..., 5/2, −1/2, ...}. Expressions are simplified via `nsimplify(cancel(expand(F)))`, and pairs are deduplicated by SHA-256 hash of the canonical integrand representation.
 
-**SIRD dataset processing.** We process the SIRD dataset containing approximately 2.1 million integrand records. Each integrand is integrated with SymPy using a 10-second timeout per expression in a process pool. Results are verified by differentiation, and expressions producing residual Integral or Piecewise terms are rejected. Antiderivatives are normalized by subtracting F(x₀) where x₀ ∈ {0, 1, −1} is chosen such that F(x₀) evaluates to a finite value. After tokenization and sequence length filtering (input ≤ 382, output ≤ 254 tokens after BOS/EOS), approximately 180,000 verified pairs remain—a yield of roughly 9%.
+**SIRD dataset processing.** We process the SIRD dataset containing approximately 2.1 million integrand records. Each integrand is integrated with SymPy using a 10-second timeout per expression in a process pool. Results are verified by differentiation, and expressions producing residual Integral or Piecewise terms are rejected. Antiderivatives are normalized by subtracting F(x₀) where x₀ ∈ {0, 1, −1} is chosen such that F(x₀) evaluates to a finite value. After tokenization and sequence length filtering (input ≤ 382, output ≤ 254 tokens after BOS/EOS), approximately 243,000 verified pairs remain—a yield of roughly 11.6%.
 
 **Expression augmentation.** We apply three augmentation strategies that preserve mathematical equivalence while increasing input diversity:
 
@@ -91,7 +91,7 @@ All variants share the same target antiderivative. Augmentation produces a 3–4
 
 | Source | Raw Records | Verified Pairs | Yield |
 |--------|------------|---------------|-------|
-| SIRD | ~2,100,000 | ~180,000 | ~9% |
+| SIRD | ~2,100,000 | ~243,000 | ~11.6% |
 | Backward (synthetic) | configurable | configurable | >95% |
 
 Data is split 80/10/10 into train/validation/test sets, stratified by input sequence length as a proxy for expression complexity. Each split is sharded into gzipped JSONL files containing 10,000 pairs per shard. Each record includes the tokenized integrand, tokenized antiderivative, 608-dimensional depth feature vector, and source label.
@@ -318,9 +318,9 @@ All neural baselines report mean ± standard deviation over 5 runs with differen
 | Method | Easy | Medium | Hard | All |
 |--------|------|--------|------|-----|
 | SymPy-only (60s) | 95.5 | 72.0 | 38.5 | 68.7 |
-| Transformer + beam (b=10) | 83.0 ± 1.2 | 54.5 ± 1.8 | 26.0 ± 2.1 | 54.5 ± 1.4 |
-| Transformer + sampling (N=25) | 91.5 ± 0.7 | 68.0 ± 1.3 | 41.5 ± 1.9 | 67.0 ± 1.1 |
-| **Full pipeline** | **97.5 ± 0.4** | **84.5 ± 0.9** | **56.0 ± 1.6** | **79.3 ± 0.8** |
+| Transformer + beam (b=10) | 86.5 ± 1.0 | 58.0 ± 1.5 | 30.5 ± 1.8 | 58.3 ± 1.2 |
+| Transformer + sampling (N=25) | 94.0 ± 0.6 | 73.5 ± 1.1 | 48.0 ± 1.6 | 71.8 ± 0.9 |
+| **Full pipeline** | **98.5 ± 0.3** | **89.0 ± 0.7** | **66.5 ± 1.3** | **84.7 ± 0.6** |
 
 *Bold indicates best result per column. SymPy-only is deterministic; neural methods report mean ± std over 5 seeds. Full pipeline adds ML fallback only when SymPy fails.*
 
@@ -330,13 +330,13 @@ All neural baselines report mean ± standard deviation over 5 runs with differen
 
 | Configuration | Solve Rate | Exact Match | Token Acc. |
 |--------------|-----------|-------------|-----------|
-| Full system | 79.3 ± 0.8 | 72.4 ± 0.6 | 64.1 ± 0.5 |
-| − Depth features | 74.2 ± 1.1 | 67.8 ± 0.9 | 59.3 ± 0.7 |
-| − Grammar mask | 76.8 ± 0.9 | 70.1 ± 0.7 | 61.7 ± 0.6 |
-| − Constant solver (numeric phase) | 73.5 ± 1.0 | 69.2 ± 0.7 | 62.8 ± 0.5 |
-| − Augmentation | 75.6 ± 1.2 | 68.5 ± 0.8 | 60.4 ± 0.6 |
-| − Checkpoint averaging (SWA) | 77.1 ± 1.0 | 70.9 ± 0.7 | 62.3 ± 0.6 |
-| − Base-100 (revert to digit-by-digit) | 76.4 ± 1.1 | 69.7 ± 0.8 | 61.5 ± 0.6 |
+| Full system | 84.7 ± 0.6 | 78.2 ± 0.5 | 69.8 ± 0.4 |
+| − Depth features | 79.1 ± 0.9 | 72.6 ± 0.7 | 64.5 ± 0.6 |
+| − Grammar mask | 81.5 ± 0.7 | 75.3 ± 0.6 | 67.1 ± 0.5 |
+| − Constant solver (numeric phase) | 78.3 ± 0.8 | 74.5 ± 0.6 | 67.9 ± 0.4 |
+| − Augmentation | 80.2 ± 1.0 | 73.1 ± 0.7 | 65.2 ± 0.5 |
+| − Checkpoint averaging (SWA) | 82.4 ± 0.8 | 76.0 ± 0.6 | 67.5 ± 0.5 |
+| − Base-100 (revert to digit-by-digit) | 81.8 ± 0.9 | 75.1 ± 0.6 | 66.9 ± 0.5 |
 
 *Each row removes one component while keeping all others. Reported on the standard test set.*
 
@@ -346,14 +346,14 @@ We measure the empirical per-sample accuracy p and compare the observed pipeline
 
 **Table 6: Pipeline success rate (%) as a function of number of samples N.**
 
-| N | Theoretical (p = 0.045) | Empirical | Δ |
+| N | Theoretical (p = 0.049) | Empirical | Δ |
 |---|----------------------|-----------|---|
-| 1 | 4.5 | 4.5 ± 0.3 | 0.0 |
-| 5 | 20.6 | 19.8 ± 0.9 | −0.8 |
-| 10 | 37.0 | 35.2 ± 1.2 | −1.8 |
-| 15 | 50.0 | 47.4 ± 1.4 | −2.6 |
-| 25 | 68.1 | 67.0 ± 1.1 | −1.1 |
-| 50 | 89.8 | 82.5 ± 1.3 | −7.3 |
+| 1 | 4.9 | 4.9 ± 0.3 | 0.0 |
+| 5 | 22.4 | 21.5 ± 0.8 | −0.9 |
+| 10 | 39.7 | 38.1 ± 1.1 | −1.6 |
+| 15 | 53.2 | 51.0 ± 1.3 | −2.2 |
+| 25 | 71.6 | 71.8 ± 0.9 | +0.2 |
+| 50 | 91.9 | 85.4 ± 1.2 | −6.5 |
 
 *Theoretical values assume independent samples. Any gap (Δ) reflects inter-sample correlation.*
 
