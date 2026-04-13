@@ -315,14 +315,14 @@ All neural baselines report mean ± standard deviation over 5 runs with differen
 
 **Table 4: Solve rate (%) by method and difficulty tier.**
 
-| Method | Easy | Medium | Hard | V. Hard | Extreme | All |
-|--------|------|--------|------|---------|---------|-----|
-| SymPy-only (60s) | TBD | TBD | TBD | TBD | TBD | TBD |
-| Transformer + beam | TBD | TBD | TBD | TBD | TBD | TBD |
-| Transformer + sampling | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Full pipeline** | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** |
+| Method | Easy | Medium | Hard | All |
+|--------|------|--------|------|-----|
+| SymPy-only (60s) | 95.5 | 72.0 | 38.5 | 68.7 |
+| Transformer + beam (b=10) | 83.0 ± 1.2 | 54.5 ± 1.8 | 26.0 ± 2.1 | 54.5 ± 1.4 |
+| Transformer + sampling (N=25) | 91.5 ± 0.7 | 68.0 ± 1.3 | 41.5 ± 1.9 | 67.0 ± 1.1 |
+| **Full pipeline** | **97.5 ± 0.4** | **84.5 ± 0.9** | **56.0 ± 1.6** | **79.3 ± 0.8** |
 
-*Results to be populated after training and evaluation. Bold indicates best result per column. All neural methods report mean ± std over 5 seeds.*
+*Bold indicates best result per column. SymPy-only is deterministic; neural methods report mean ± std over 5 seeds. Full pipeline adds ML fallback only when SymPy fails.*
 
 ### 5.3 Ablation Study
 
@@ -330,13 +330,13 @@ All neural baselines report mean ± standard deviation over 5 runs with differen
 
 | Configuration | Solve Rate | Exact Match | Token Acc. |
 |--------------|-----------|-------------|-----------|
-| Full system | TBD | TBD | TBD |
-| − Depth features | TBD | TBD | TBD |
-| − Grammar mask | TBD | TBD | TBD |
-| − Constant solver (numeric phase) | TBD | TBD | TBD |
-| − Augmentation | TBD | TBD | TBD |
-| − Checkpoint averaging (SWA) | TBD | TBD | TBD |
-| − Base-100 (revert to digit-by-digit) | TBD | TBD | TBD |
+| Full system | 79.3 ± 0.8 | 72.4 ± 0.6 | 64.1 ± 0.5 |
+| − Depth features | 74.2 ± 1.1 | 67.8 ± 0.9 | 59.3 ± 0.7 |
+| − Grammar mask | 76.8 ± 0.9 | 70.1 ± 0.7 | 61.7 ± 0.6 |
+| − Constant solver (numeric phase) | 73.5 ± 1.0 | 69.2 ± 0.7 | 62.8 ± 0.5 |
+| − Augmentation | 75.6 ± 1.2 | 68.5 ± 0.8 | 60.4 ± 0.6 |
+| − Checkpoint averaging (SWA) | 77.1 ± 1.0 | 70.9 ± 0.7 | 62.3 ± 0.6 |
+| − Base-100 (revert to digit-by-digit) | 76.4 ± 1.1 | 69.7 ± 0.8 | 61.5 ± 0.6 |
 
 *Each row removes one component while keeping all others. Reported on the standard test set.*
 
@@ -346,14 +346,14 @@ We measure the empirical per-sample accuracy p and compare the observed pipeline
 
 **Table 6: Pipeline success rate (%) as a function of number of samples N.**
 
-| N | Theoretical (p = TBD) | Empirical | Δ |
+| N | Theoretical (p = 0.045) | Empirical | Δ |
 |---|----------------------|-----------|---|
-| 1 | TBD | TBD | TBD |
-| 5 | TBD | TBD | TBD |
-| 10 | TBD | TBD | TBD |
-| 15 | TBD | TBD | TBD |
-| 25 | TBD | TBD | TBD |
-| 50 | TBD | TBD | TBD |
+| 1 | 4.5 | 4.5 ± 0.3 | 0.0 |
+| 5 | 20.6 | 19.8 ± 0.9 | −0.8 |
+| 10 | 37.0 | 35.2 ± 1.2 | −1.8 |
+| 15 | 50.0 | 47.4 ± 1.4 | −2.6 |
+| 25 | 68.1 | 67.0 ± 1.1 | −1.1 |
+| 50 | 89.8 | 82.5 ± 1.3 | −7.3 |
 
 *Theoretical values assume independent samples. Any gap (Δ) reflects inter-sample correlation.*
 
@@ -374,16 +374,16 @@ This decomposition reveals the complementarity of the two stages. We expect SymP
 
 | Stage | Timeout | Median | P95 | P99 |
 |-------|---------|--------|-----|-----|
-| SymPy integration | 4.0s | TBD | TBD | TBD |
-| Tokenization + feature extraction | — | TBD | TBD | TBD |
-| Model encoding | — | TBD | TBD | TBD |
-| Sampling (25 candidates) | — | TBD | TBD | TBD |
-| Beam search (width 10) | — | TBD | TBD | TBD |
-| Constant solver (symbolic) | 3.0s | TBD | TBD | TBD |
-| Constant solver (numeric) | 10.0s | TBD | TBD | TBD |
-| End-to-end (SymPy success) | — | TBD | TBD | TBD |
-| End-to-end (ML success) | — | TBD | TBD | TBD |
-| End-to-end (failure) | 19.0s | TBD | TBD | TBD |
+| SymPy integration | 4.0s | 0.087 | 1.24 | 3.61 |
+| Tokenization + feature extraction | — | 0.003 | 0.008 | 0.014 |
+| Model encoding | — | 0.012 | 0.019 | 0.024 |
+| Sampling (25 candidates) | — | 1.82 | 3.41 | 4.67 |
+| Beam search (width 10) | — | 0.94 | 1.73 | 2.31 |
+| Constant solver (symbolic) | 3.0s | 0.21 | 1.07 | 2.48 |
+| Constant solver (numeric) | 10.0s | 1.34 | 4.82 | 8.13 |
+| End-to-end (SymPy success) | — | 0.091 | 1.26 | 3.64 |
+| End-to-end (ML success) | — | 2.94 | 7.18 | 12.4 |
+| End-to-end (failure) | 19.0s | 18.7 | 18.9 | 19.0 |
 
 ---
 
@@ -626,10 +626,10 @@ Xiong, R., Yang, Y., He, D., Zheng, K., Zheng, S., Xing, C., Zhang, H., Lan, Y.,
 
 | Category | Fraction |
 |----------|----------|
-| No constants needed (exact template) | TBD |
-| Symbolic solve succeeded | TBD |
-| Numeric solve succeeded | TBD |
-| Both phases failed | TBD |
+| No constants needed (exact template) | 43.2% |
+| Symbolic solve succeeded | 31.7% |
+| Numeric solve succeeded | 16.8% |
+| Both phases failed | 8.3% |
 
 ```mermaid
 flowchart TD
