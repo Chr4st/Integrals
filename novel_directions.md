@@ -13,11 +13,11 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 | Complex contour integrals (symbolic) | Numerical only (Feynman physics) | Total gap in symbolic setting | Very high |
 | Definite integrals (closed-form) | One pre-transformer 2019 paper | Direct Lample-Charton extension untouched | High |
 | Multivariate antiderivatives | Numerical only (JHEP 2023) | Symbolic task completely absent | High |
-| Differential forms / exterior calculus | Numerical FEEC, type-system SR | Symbolic manipulation of forms absent | Very high |
+| Parametric integral families | No neural work on symbolic parameters | Universal antiderivatives with case splits absent | Very high |
 | Special function integration | Gap explicitly noted in Oct 2025 survey | Non-elementary output prediction absent | High |
 | Oscillatory integrals (symbolic asymptotics) | Numerical methods active 2024-2026 | Symbolic asymptotic prediction absent | Medium-high |
-| Tree PE for symbolic math | Active for OCR/code, not math reasoning | Ablation on integration tasks missing | Medium |
-| Neural integration + Lean/Coq proofs | LLM theorem proving booming, calculus absent | Zero work connecting these fields | Very high |
+| Recursive decomposition | AlphaIntegrator does search, but hand-built action space | Learned reduction rules for integration absent | Very high |
+| Differential forms / exterior calculus | Numerical FEEC, type-system SR | Symbolic integration of forms absent | Very high |
 | Integration on manifolds | Nothing in ML | Completely blank | Extreme |
 
 ---
@@ -80,31 +80,33 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 
 ---
 
-### Paper 3: Neural Antiderivatives with Lean 4 Proof Certificates
+### Paper 3: Solving Parametric Integral Families via Transformer
 
-**Title idea:** "Formally Verified Symbolic Integration: Neural Antiderivative Prediction with Lean Proof Certificates"
+**Title idea:** "Learning Parametric Integral Families: Transformer-Based Symbolic Integration with Parameter Generalization"
 
-**Task definition.** Given an integrand f(x), the system: (1) predicts an antiderivative F(x) using a transformer, (2) generates a Lean 4 tactic proof that `deriv F x = f x`, verified by the Lean type-checker. Every returned result comes with a machine-checkable certificate of correctness.
+**Task definition.** Given a parametric integrand f(x; a, b, c) with symbolic parameters, predict the antiderivative F(x; a, b, c) that is valid for all parameter values (or with stated constraints like a > 0). Examples: integral x^a dx = x^{a+1}/(a+1) for a != -1, integral e^{ax} cos(bx) dx = e^{ax}(a cos(bx) + b sin(bx))/(a^2 + b^2).
 
-**Why it's novel.** Neural theorem proving (AlphaProof, Leanstral, miniF2F) and neural integration (Lample & Charton) are both active fields, but they have never intersected. No paper connects symbolic antiderivative computation to formal proofs. This produces correctness guarantees strictly stronger than differentiation-and-simplify (which can have false negatives when simplification fails).
-
-**Architecture.**
-- Stage 1: Standard Lample-Charton style transformer predicts F(x) as a symbolic expression.
-- Stage 2: A proof-generation module (could be a separate LLM fine-tuned on Mathlib proofs, or a template-based tactic generator) produces a Lean proof of `HasDerivAt F f x` or `deriv F x = f x`.
-- Verification: Lean type-checker. This is a perfect oracle: decidable, no false positives, no false negatives.
+**Why it's novel.** Lample & Charton and all follow-on work train on integrands with fixed numeric coefficients. No neural integration paper handles symbolic parameters as free variables. Classical CAS systems do this via the Risch algorithm's parametric case, but neural approaches have never attempted it. The model must learn to produce antiderivatives that are *universally valid* across parameter ranges, including recognizing when case splits are needed (e.g., a = -1 vs a != -1 for x^a).
 
 **Data generation.**
-- Mine Mathlib's `Analysis.SpecialFunctions` and `MeasureTheory.Integral` for existing proved integration lemmas as seed data.
-- Generate (f, F, proof) triples: for each backward-generated (f, F) pair, construct the Lean proof that `deriv F = f`. For elementary functions, these proofs follow mechanical patterns using `simp`, `ring`, `deriv_rules`.
-- Bootstrap: start with simple proofs (polynomial derivatives), progressively add trig, exp, log, compositions via chain rule.
+- Extend backward generation: generate antiderivatives F(x; a, b) with 1-3 symbolic parameters drawn from {a, b, c, alpha, beta, n, k}.
+- Differentiate with respect to x to get the integrand.
+- Include parameter constraints as metadata (a > 0, n is integer, b != 0).
+- Generate case-split pairs: same integrand with different parameter regimes yielding different antiderivatives.
+- Target: 400K pairs, ~100K with parameter constraints or case splits.
 
-**Key insight.** The differentiation proof for elementary functions is highly structured and can be generated programmatically from the expression tree. Each node in the AST corresponds to a differentiation rule (chain rule, product rule, etc.) that maps to a Mathlib lemma. The proof generation is essentially a recursive walk of the expression tree, emitting the appropriate tactic at each step.
+**New modeling challenges.**
+- The model must distinguish integration variable x from parameters a, b, c. Inject via `[VAR x]` and `[PARAM a]` tokens.
+- Case splits: the model must learn to output conditional antiderivatives (if a != -1 then ... else ...).
+- Constraint propagation: certain forms only have elementary antiderivatives under constraints (e.g., integral x^n e^x dx requires n to be a non-negative integer for a finite closed form).
 
-**Expected contribution level:** Top venue. Bridges two literatures in a novel way with a clean, well-defined contribution.
+**Verification oracle.** Differentiate F(x; a, b) with respect to x, treating parameters as constants. Check d/dx F = f symbolically. Then spot-check by substituting random numeric parameter values and verifying numerically. Oracle quality: perfect (parametric differentiation is exact).
 
-**Estimated difficulty:** High. Lean/Mathlib infrastructure for differentiation is mature but requires expertise. The proof generation module is the main engineering challenge.
+**Expected contribution level:** Top venue (ICML/NeurIPS). Generalizes the foundational work along a dimension no one has explored.
 
-**Key references:** Lample & Charton (ICLR 2020), AlphaProof (DeepMind 2024), Mathlib, Polu & Sutskever (2020)
+**Estimated difficulty:** Medium-high. Parameter handling and case splits are the main challenges. The existing tokenizer needs parameter tokens.
+
+**Key references:** Lample & Charton (ICLR 2020), Bronstein "Symbolic Integration I" (parametric Risch), Kamienny et al. (NeurIPS 2022, parametric symbolic regression)
 
 ---
 
@@ -187,34 +189,49 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 
 ---
 
-### Paper 7: Algebraically-Aware Tree Positional Encodings for Symbolic Math
+### Paper 7: Solving Integrals via Recursive Decomposition with Learned Reduction Rules
 
-**Title idea:** "Commutativity-Aware Tree Positional Encodings for Neural Symbolic Mathematics"
+**Title idea:** "Neural Integration by Learned Reduction: Transformer-Guided Recursive Decomposition of Integrals"
 
-**Task definition.** Design and evaluate tree positional encodings that encode algebraic properties of expression trees (commutativity of +/*, associativity, distributivity) rather than treating all binary operators as generic nodes. Evaluate on integration, simplification, and equation solving benchmarks.
+**Task definition.** Instead of predicting the antiderivative in one shot (Lample-Charton style), train a transformer to decompose a hard integral into simpler sub-integrals via learned reduction rules, then solve each sub-integral. The model outputs a sequence of reduction steps: integration by parts, substitution, partial fractions, trig identity, etc., each producing a simpler integrand, until base cases are reached.
 
-**Why it's novel.** Existing tree PE work (Shiv & Quirk NeurIPS 2019, EMNLP 2022) targets code ASTs and handwriting recognition, not symbolic math reasoning. No ablation study compares PE strategies on integration tasks. No PE encodes that the children of Add/Mul nodes are order-invariant.
+**Why it's novel.** Lample & Charton predict the final answer directly. AlphaIntegrator (2024) does step-by-step search but relies on a hand-built action space of CAS operations. No paper trains a model to *learn* the reduction rules themselves from data and apply them recursively. This is analogous to how humans actually solve integrals: recognize a pattern, apply a technique, simplify, repeat.
 
-**Proposed encodings.**
-- **Algebraic PE:** For commutative operators, canonicalize child ordering (e.g., alphabetical) and encode both children at the same depth level. For non-commutative operators (Pow, Div), encode left/right asymmetrically.
-- **Depth-breadth PE:** Encode (depth, breadth-position) as a 2D sinusoidal embedding, where breadth-position is computed after canonical ordering.
-- **Path PE:** Encode the root-to-node path as a sequence of (operator, child-index) pairs, with canonical ordering for commutative nodes.
+**Data generation.**
+- For each (f, F) pair from backward generation, use CAS to find an integration strategy (substitution u = g(x), integration by parts with specific u/dv split, partial fraction decomposition).
+- Record the strategy as a sequence of (rule, arguments, resulting sub-integrand) triples.
+- Train on (integrand, strategy sequence, final answer) triples.
+- For integrands solvable by multiple strategies, include all valid decomposition paths.
+- Target: 300K pairs with strategy annotations.
 
-**Evaluation.** Ablation on Lample-Charton's integration benchmark: compare flat sequence PE, vanilla tree PE, and algebraically-aware tree PE. Measure token accuracy, exact match, and solve rate. Test generalization to out-of-distribution expression depths.
+**Architecture.**
+- Encoder processes the integrand.
+- Decoder operates in two modes: (a) predict a reduction rule + arguments (substitution variable, IBP split), (b) predict a base-case antiderivative when the integrand is simple enough.
+- Recursive application: apply the predicted reduction, feed the resulting sub-integrand back into the model.
+- Tree-structured beam search over reduction sequences.
 
-**Expected contribution level:** Workshop or mid-tier venue (EMNLP, ACL). Incremental but practically useful.
+**New modeling challenges.**
+- The model must learn when to reduce vs when to directly predict.
+- Strategy diversity: the same integral can be solved by substitution or by parts. The model should find *any* valid path.
+- Depth limit: recursive decomposition can loop. Need a maximum recursion depth with fallback to direct prediction.
 
-**Estimated difficulty:** Low-medium. Primarily an engineering and ablation study.
+**Verification oracle.** Same as standard: differentiate the final assembled antiderivative. Each intermediate step can also be verified: if the reduction rule is "substitute u = g(x)", verify that the transformed integrand times du/dx equals the original. Oracle quality: perfect at every step.
+
+**Expected contribution level:** Top venue (ICML/NeurIPS/ICLR). Fundamentally different inference paradigm from one-shot prediction.
+
+**Estimated difficulty:** High. Multi-step generation with intermediate verification. Training data annotation is the bottleneck.
+
+**Key references:** Lample & Charton (ICLR 2020), AlphaIntegrator (arXiv:2410.02666), TPSR (NeurIPS 2023, tree-based planning for symbolic regression), SIRD (NeurIPS 2023 workshop, rule prediction)
 
 ---
 
 ## Implications
 
-**For the Integrals project specifically:** Papers 2 (definite integrals) and 4 (special functions) are the most natural extensions of the current codebase. The existing tokenizer, feature extractor, and training pipeline can be adapted with moderate effort. Paper 7 (tree PE) could be integrated into the existing model as an architectural improvement.
+**For the Integrals project specifically:** Papers 2 (definite integrals) and 4 (special functions) are the most natural extensions of the current codebase. The existing tokenizer, feature extractor, and training pipeline can be adapted with moderate effort. Paper 3 (parametric families) extends the data generator with symbolic parameter support.
 
-**For the field broadly:** Papers 1 (contour integrals) and 3 (Lean proofs) open genuinely new research directions rather than incremental improvements. They would attract attention from the complex analysis and formal methods communities respectively, broadening the audience beyond the neural symbolic math niche.
+**For the field broadly:** Papers 1 (contour integrals) and 7 (recursive decomposition) represent fundamentally new inference paradigms for solving integrals. Paper 1 extends integration to the complex plane. Paper 7 replaces one-shot prediction with multi-step reasoning, closer to how mathematicians actually solve integrals.
 
-**Publication strategy:** Papers 1-3 are top-venue material (ICML/NeurIPS/ICLR). Paper 4 is strong but incremental. Papers 5-6 are solid contributions. Paper 7 is a workshop/short paper.
+**Publication strategy:** Papers 1, 3, and 7 are top-venue material (ICML/NeurIPS/ICLR). Paper 2 is a direct and strong extension. Papers 4-6 are solid contributions. All seven papers directly solve integrals as their core task.
 
 ---
 
@@ -222,9 +239,10 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 
 - **Data generation feasibility:** Papers 1 and 6 require generating training data for tasks (contour integrals, asymptotic expansions) where CAS support is less mature than for indefinite integration. SymPy's residue computation is good but not comprehensive for essential singularities.
 - **Oracle quality:** Papers 2, 6, and partially 1 rely on numerical verification rather than exact symbolic verification. This weakens the "perfect oracle" narrative that makes indefinite integration special.
-- **Lean infrastructure (Paper 3):** Mathlib's differentiation library is mature but interfacing with it programmatically for proof generation requires significant Lean expertise.
+- **Parametric case splits (Paper 3):** Handling conditional antiderivatives (a = -1 vs a != -1) is a modeling challenge with no precedent in seq2seq math.
+- **Recursive depth (Paper 7):** Multi-step decomposition can loop or diverge. Needs careful depth limits and fallback to direct prediction.
 - **Scope creep:** Papers 4 (special functions) and 5 (multivariate) each could be scoped too broadly. Recommend restricting to 2-3 special function families or bivariate-only for a first paper.
-- **Reviewer skepticism:** The integration community may question whether these extensions face the same "biased test set" criticism that Dor & Leron (2019) raised against Lample & Charton. Mitigate by using held-out test sets from independent sources (GR tables, DLMF, Mathlib lemmas).
+- **Reviewer skepticism:** The integration community may question whether these extensions face the same "biased test set" criticism that Dor & Leron (2019) raised against Lample & Charton. Mitigate by using held-out test sets from independent sources (GR tables, DLMF).
 
 ---
 
@@ -234,7 +252,7 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 
 **If pursuing two papers in parallel:** Pair Paper 2 with **Paper 4 (Special Functions)**. Both extend the output space of the existing model and share infrastructure (tokenizer, training loop, verification). Together they cover "harder bounds" and "harder integrands," the two natural axes of difficulty.
 
-**If pursuing a high-risk/high-reward direction:** Go with **Paper 1 (Contour Integrals)** or **Paper 3 (Lean Proofs)**. These open entirely new research threads rather than extending existing ones.
+**If pursuing a high-risk/high-reward direction:** Go with **Paper 1 (Contour Integrals)** or **Paper 7 (Recursive Decomposition)**. Paper 1 opens integration to the complex plane. Paper 7 replaces one-shot prediction with multi-step solving, a fundamentally different and more interpretable approach.
 
 ---
 
@@ -250,8 +268,9 @@ We surveyed the full landscape of neural symbolic integration research (43 exist
 - Dor & Leron, "Review of Lample and Charton," arXiv:1912.05752 (2019)
 - Raab, "Generalization of Risch's Algorithm to Special Functions," CASC 2013 (arXiv:1305.1481)
 - Iravanian et al., "Symbolic-Numeric Integration based on Sparse Regression," arXiv:2201.12468 (2022)
-- Song, "Neuro-Symbolic Theorem Proving with Lean," tutorial (2024)
-- Calisto et al., "Learning Feynman Integrals from DEs with NNs," JHEP 2024 (arXiv:2312.02067)
+- Kamienny et al., "End-to-end symbolic regression with transformers," NeurIPS 2022 (parametric symbolic regression)
+- SIRD, "Symbolic Integration Rules Dataset," NeurIPS MATH-AI Workshop 2023
+- Shojaee et al., "TPSR: Transformer-based planning for symbolic regression," NeurIPS 2023
 - Welleck et al., "Symbolic Brittleness in Sequence Models," AAAI 2022 (arXiv:2109.13986)
 - Gradshteyn & Ryzhik, "Table of Integrals, Series, and Products," Academic Press
 - NIST Digital Library of Mathematical Functions (DLMF), https://dlmf.nist.gov
