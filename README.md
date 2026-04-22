@@ -1,6 +1,6 @@
 # Integral Prediction Engine
 
-Technical deep-dive into LeanLab's ML-powered symbolic integral solver.
+Technical deep-dive into a ML-powered symbolic integral solver.
 
 ## What It Does
 
