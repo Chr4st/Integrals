@@ -101,6 +101,74 @@ class TestIntegralTransformer:
         assert torch.allclose(out1, out2, atol=1e-6)
 
 
+class TestAsymmetricDepth:
+    """Spec 2: Asymmetric encoder-decoder layer counts."""
+
+    def test_asymmetric_forward_pass(self):
+        config = {**_SMALL_CONFIG, "num_encoder_layers": 1, "num_decoder_layers": 3}
+        model = IntegralTransformer(**config)
+        model.eval()
+        src = torch.randint(0, SEQ_VOCAB_SIZE, (2, 8))
+        tgt = torch.randint(0, SEQ_VOCAB_SIZE, (2, 6))
+        feat = torch.randn(2, FEATURE_DIM)
+        logits = model(src, tgt, feat)
+        assert logits.shape == (2, 6, SEQ_VOCAB_SIZE)
+        assert not torch.isnan(logits).any()
+
+    def test_asymmetric_gradient_flow(self):
+        config = {**_SMALL_CONFIG, "num_encoder_layers": 1, "num_decoder_layers": 3}
+        model = IntegralTransformer(**config)
+        model.train()
+        src = torch.randint(0, SEQ_VOCAB_SIZE, (1, 5))
+        tgt = torch.randint(0, SEQ_VOCAB_SIZE, (1, 4))
+        feat = torch.randn(1, FEATURE_DIM)
+        logits = model(src, tgt, feat)
+        logits.sum().backward()
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+        assert has_grad
+
+    def test_asymmetric_param_count_higher(self):
+        symmetric = IntegralTransformer(**{**_SMALL_CONFIG, "num_encoder_layers": 2, "num_decoder_layers": 2})
+        asymmetric = IntegralTransformer(**{**_SMALL_CONFIG, "num_encoder_layers": 1, "num_decoder_layers": 3})
+        sym_params = sum(p.numel() for p in symmetric.parameters())
+        asym_params = sum(p.numel() for p in asymmetric.parameters())
+        assert asym_params > sym_params
+
+
+class TestModelScaling:
+    """Spec 8: Model scaling + get_config for checkpoint serialization."""
+
+    @pytest.mark.parametrize("d_model,nhead", [(64, 4), (128, 8), (256, 16)])
+    def test_scaled_forward_pass(self, d_model, nhead):
+        config = {**_SMALL_CONFIG, "d_model": d_model, "nhead": nhead, "dim_feedforward": d_model * 4}
+        model = IntegralTransformer(**config)
+        model.eval()
+        src = torch.randint(0, SEQ_VOCAB_SIZE, (2, 6))
+        tgt = torch.randint(0, SEQ_VOCAB_SIZE, (2, 4))
+        feat = torch.randn(2, FEATURE_DIM)
+        logits = model(src, tgt, feat)
+        assert logits.shape == (2, 4, SEQ_VOCAB_SIZE)
+        assert not torch.isnan(logits).any()
+
+    def test_get_config_roundtrip(self):
+        config = {**_SMALL_CONFIG, "num_encoder_layers": 2, "num_decoder_layers": 4}
+        model = IntegralTransformer(**config)
+        recovered = model.get_config()
+        model2 = IntegralTransformer(**recovered)
+        assert model.get_config() == model2.get_config()
+        for (k1, v1), (k2, v2) in zip(model.state_dict().items(), model2.state_dict().items()):
+            assert k1 == k2
+            assert v1.shape == v2.shape
+
+    def test_get_config_contains_all_params(self):
+        model = IntegralTransformer(**_SMALL_CONFIG)
+        config = model.get_config()
+        expected_keys = {"vocab_size", "d_model", "nhead", "num_encoder_layers",
+                         "num_decoder_layers", "dim_feedforward", "dropout", "feature_dim",
+                         "num_backward_decoder_layers"}
+        assert set(config.keys()) == expected_keys
+
+
 class TestBeamSearch:
     def test_beam_count(self):
         model = IntegralTransformer(**_SMALL_CONFIG)
