@@ -40,6 +40,7 @@ _model_device = None
 
 SYMPY_TIMEOUT = 4.0
 ML_TIMEOUT = 15.0
+N_SAMPLES = int(os.environ.get("INTEGRAL_N_SAMPLES", "40"))
 
 # Phase 10: Persistent process pool singleton for SymPy stage
 _sympy_pool: Optional[ProcessPoolExecutor] = None
@@ -199,7 +200,22 @@ def _load_model() -> Tuple[Any, Any]:
     else:
         device = torch.device("cpu")
 
-    model = IntegralTransformer()
+    _KNOWN_CONFIG_KEYS = {
+        "vocab_size", "d_model", "nhead", "num_encoder_layers",
+        "num_decoder_layers", "dim_feedforward", "dropout", "feature_dim",
+        "num_backward_decoder_layers",
+    }
+
+    model_config: dict = {}
+    if os.path.exists(checkpoint_path):
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        saved_config = raw.get("model_config", {})
+        unknown = set(saved_config) - _KNOWN_CONFIG_KEYS
+        if unknown:
+            logger.warning("model_config_unknown_keys", keys=sorted(unknown))
+        model_config = {k: v for k, v in saved_config.items() if k in _KNOWN_CONFIG_KEYS}
+
+    model = IntegralTransformer(**model_config) if model_config else IntegralTransformer()
 
     if os.path.exists(checkpoint_path):
         checkpoint = _validate_checkpoint(checkpoint_path, model)
@@ -261,9 +277,8 @@ def _try_candidate(
 def _ml_solve(expr_str: str, var_str: str) -> Optional[Tuple[str, float]]:
     """ML inference + constant solving. Returns (latex, confidence) or None.
 
-    Phase 5: Primary strategy is temperature sampling with verification oracle.
-    Generates N=25 diverse samples, verifies each with SymPy differentiation.
-    Falls back to beam search (width 10) if no sample verifies.
+    Generates N_SAMPLES diverse temperature samples, verifies each with SymPy
+    differentiation. Falls back to beam search (width 10) if no sample verifies.
     """
     import torch
 
@@ -281,25 +296,18 @@ def _ml_solve(expr_str: str, var_str: str) -> Optional[Tuple[str, float]]:
         [extract_features(expr, var).tolist()], dtype=torch.float32, device=device,
     )
 
-    # Phase 5: Sampling + verification oracle (25 samples, batched in groups of 5)
-    n_samples = 25
-    batch_size = 5
-    for batch_start in range(0, n_samples, batch_size):
-        for _ in range(batch_size):
-            try:
-                seq, log_prob = model.sample(
-                    src, depth_feat, max_len=256, temperature=0.7, top_p=0.95,
-                )
-                result = _try_candidate(seq, log_prob, expr, var)
-                if result is not None:
-                    logger.info(
-                        "sample_verified",
-                        sample_index=batch_start,
-                    )
-                    return result
-            except Exception:
-                logger.debug("sample_failed", exc_info=True)
-                continue
+    for sample_idx in range(N_SAMPLES):
+        try:
+            seq, log_prob = model.sample(
+                src, depth_feat, max_len=256, temperature=0.7, top_p=0.95,
+            )
+            result = _try_candidate(seq, log_prob, expr, var)
+            if result is not None:
+                logger.info("sample_verified", sample_index=sample_idx)
+                return result
+        except Exception:
+            logger.debug("sample_failed", exc_info=True)
+            continue
 
     # Fallback: beam search (width 10)
     logger.info("sampling_exhausted_falling_back_to_beam_search")
