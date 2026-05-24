@@ -20,6 +20,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from integral_engine.curriculum import build_curriculum_sampler
 from integral_engine.model import IntegralTransformer
 from integral_engine.vocabulary import (
     BOS_INDEX,
@@ -156,12 +157,21 @@ def train_epoch(
     criterion: nn.CrossEntropyLoss,
     device: torch.device,
     accumulation_steps: int = 1,
+    consistency_weight: float = 0.0,
 ) -> Dict[str, float]:
-    """Train for one epoch with optional gradient accumulation."""
+    """Train for one epoch with optional gradient accumulation.
+
+    When consistency_weight > 0 and model has a backward decoder,
+    computes L_forward + λ * L_backward (cycle consistency).
+    """
     model.train()
     total_loss = 0.0
+    total_bwd_loss = 0.0
     total_tokens = 0
     correct_tokens = 0
+    use_consistency = (
+        consistency_weight > 0 and model.backward_decoder is not None
+    )
 
     optimizer.zero_grad()
 
@@ -172,24 +182,52 @@ def train_epoch(
         src_mask = batch["src_mask"].to(device)
         tgt_mask = batch["tgt_mask"].to(device)
 
-        # Teacher forcing: input is tgt[:-1], target is tgt[1:]
         tgt_input = tgt[:, :-1]
         tgt_target = tgt[:, 1:]
         tgt_input_mask = tgt_mask[:, :-1]
 
-        logits = model(src, tgt_input, feat, src_mask, tgt_input_mask)
+        if use_consistency:
+            bwd_feat = torch.zeros_like(feat)
+            bwd_src_input = tgt[:, :-1]
+            bwd_src_mask = tgt_mask[:, :-1]
+            bwd_tgt_input = src
+            bwd_tgt_target = src
+            bwd_tgt_mask = src_mask
 
-        logits_flat = logits.reshape(-1, logits.size(-1))
-        target_flat = tgt_target.reshape(-1)
+            fwd_logits, bwd_logits = model.forward_backward(
+                src, tgt_input, feat,
+                bwd_src_input, bwd_tgt_input, bwd_feat,
+                src_mask, tgt_input_mask,
+                bwd_src_mask, bwd_tgt_mask,
+            )
 
-        loss = criterion(logits_flat, target_flat) / accumulation_steps
-        loss.backward()
+            fwd_flat = fwd_logits.reshape(-1, fwd_logits.size(-1))
+            fwd_target = tgt_target.reshape(-1)
+            fwd_loss = criterion(fwd_flat, fwd_target)
 
-        non_pad = target_flat != PAD_INDEX
+            bwd_flat = bwd_logits.reshape(-1, bwd_logits.size(-1))
+            bwd_target = bwd_tgt_target.reshape(-1)
+            bwd_loss = criterion(bwd_flat, bwd_target)
+
+            loss = (fwd_loss + consistency_weight * bwd_loss) / accumulation_steps
+            loss.backward()
+
+            non_pad = fwd_target != PAD_INDEX
+            total_bwd_loss += bwd_loss.item() * non_pad.sum().item()
+        else:
+            logits = model(src, tgt_input, feat, src_mask, tgt_input_mask)
+            fwd_flat = logits.reshape(-1, logits.size(-1))
+            fwd_target = tgt_target.reshape(-1)
+
+            loss = criterion(fwd_flat, fwd_target) / accumulation_steps
+            loss.backward()
+
+            non_pad = fwd_target != PAD_INDEX
+
         total_loss += loss.item() * accumulation_steps * non_pad.sum().item()
         total_tokens += non_pad.sum().item()
-        preds = logits_flat.argmax(dim=-1)
-        correct_tokens += ((preds == target_flat) & non_pad).sum().item()
+        preds = fwd_flat.argmax(dim=-1)
+        correct_tokens += ((preds == fwd_target) & non_pad).sum().item()
 
         is_accumulation_boundary = (
             (step + 1) % accumulation_steps == 0
@@ -201,10 +239,13 @@ def train_epoch(
             scheduler.step()
             optimizer.zero_grad()
 
-    return {
+    metrics = {
         "loss": total_loss / max(total_tokens, 1),
         "token_accuracy": correct_tokens / max(total_tokens, 1),
     }
+    if use_consistency:
+        metrics["bwd_loss"] = total_bwd_loss / max(total_tokens, 1)
+    return metrics
 
 
 @torch.no_grad()
@@ -272,6 +313,15 @@ def train(
     device_str: str = "auto",
     accumulation_steps: int = 1,
     max_seq_len: int = MAX_INPUT_LEN,
+    d_model: int = 512,
+    nhead: int = 8,
+    num_encoder_layers: int = 6,
+    num_decoder_layers: int = 6,
+    dim_feedforward: int = 2048,
+    curriculum: bool = False,
+    curriculum_warmup_epochs: int = 10,
+    num_backward_decoder_layers: int = 0,
+    consistency_weight: float = 0.5,
 ) -> None:
     """Full training pipeline."""
     if device_str == "auto":
@@ -305,8 +355,18 @@ def train(
         max_output_len=max_seq_len,
     )
 
+    train_sampler = None
+    if curriculum:
+        train_sampler = build_curriculum_sampler(
+            train_dataset.items,
+            warmup_epochs=curriculum_warmup_epochs,
+        )
+        print(f"Curriculum learning: warmup over {curriculum_warmup_epochs} epochs")
+
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
+        train_dataset, batch_size=batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=use_pin_memory,
     )
     val_loader = DataLoader(
@@ -316,7 +376,16 @@ def train(
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-    model = IntegralTransformer().to(device)
+    model = IntegralTransformer(
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        num_decoder_layers=num_decoder_layers,
+        dim_feedforward=dim_feedforward,
+        num_backward_decoder_layers=num_backward_decoder_layers,
+    ).to(device)
+    if num_backward_decoder_layers > 0:
+        print(f"Consistency training: backward decoder with {num_backward_decoder_layers} layers, weight={consistency_weight}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     weights = compute_class_weights(train_dataset).to(device)
@@ -331,11 +400,14 @@ def train(
     patience_counter = 0
 
     for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch - 1)
         print(f"\n--- Epoch {epoch}/{epochs} ---")
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, criterion, device,
             accumulation_steps=accumulation_steps,
+            consistency_weight=consistency_weight if num_backward_decoder_layers > 0 else 0.0,
         )
         print(
             f"Train: loss={train_metrics['loss']:.4f}, "
@@ -361,6 +433,7 @@ def train(
             "val_metrics": val_metrics,
             "architecture_hash": arch_hash,
             "feature_schema_hash": feature_schema_hash(),
+            "model_config": model.get_config(),
         }
         torch.save(ckpt_data, epoch_ckpt_path)
 
@@ -399,10 +472,34 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-seq-len", type=int, default=MAX_INPUT_LEN,
                         help="Max sequence length (filters longer examples)")
+    parser.add_argument("--d-model", type=int, default=512,
+                        help="Model embedding dimension")
+    parser.add_argument("--nhead", type=int, default=8,
+                        help="Number of attention heads")
+    parser.add_argument("--num-encoder-layers", type=int, default=6)
+    parser.add_argument("--num-decoder-layers", type=int, default=6)
+    parser.add_argument("--dim-feedforward", type=int, default=2048)
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Enable curriculum learning (easy→hard)")
+    parser.add_argument("--curriculum-warmup-epochs", type=int, default=10,
+                        help="Epochs to ramp from easiest to full difficulty")
+    parser.add_argument("--num-backward-decoder-layers", type=int, default=0,
+                        help="Backward decoder layers for consistency training (0=disabled)")
+    parser.add_argument("--consistency-weight", type=float, default=0.5,
+                        help="Weight for backward consistency loss")
     args = parser.parse_args()
 
     train(
         args.data, args.checkpoint, args.epochs, args.batch_size,
         args.lr, args.patience, args.device, args.accumulation_steps,
         args.max_seq_len,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.dim_feedforward,
+        curriculum=args.curriculum,
+        curriculum_warmup_epochs=args.curriculum_warmup_epochs,
+        num_backward_decoder_layers=args.num_backward_decoder_layers,
+        consistency_weight=args.consistency_weight,
     )
