@@ -1,9 +1,11 @@
 """Encoder-decoder Transformer for integral prediction.
 
-Architecture:
-  - 8 attention heads, 6 encoder/decoder layers, 512-dim embeddings
+Architecture (defaults):
+  - 8 attention heads, 6 encoder / 6 decoder layers, 512-dim embeddings
   - Feed-forward dim 2048, dropout 0.1
-  - Depth feature injection: FEATURE_DIM → 512-dim linear, prepended as [FEAT] token
+  - Depth feature injection: FEATURE_DIM → d_model linear, prepended as [FEAT] token
+  - All dimensions configurable via constructor; use get_config() for checkpoint
+    serialization so solver.py can reconstruct the correct architecture.
 """
 from __future__ import annotations
 
@@ -58,6 +60,7 @@ class IntegralTransformer(nn.Module):
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         feature_dim: int = FEATURE_DIM,
+        num_backward_decoder_layers: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -83,7 +86,36 @@ class IntegralTransformer(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         self.output_proj = nn.Linear(d_model, vocab_size)
+
+        # Spec 4: backward decoder for F→f consistency training
+        self.backward_decoder = None
+        if num_backward_decoder_layers > 0:
+            bwd_layer = nn.TransformerDecoderLayer(
+                d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                dropout=dropout, batch_first=True, norm_first=True,
+            )
+            self.backward_decoder = nn.TransformerDecoder(
+                bwd_layer, num_layers=num_backward_decoder_layers,
+            )
+            self.backward_output_proj = nn.Linear(d_model, vocab_size)
+
+        self._config = {
+            "vocab_size": vocab_size,
+            "d_model": d_model,
+            "nhead": nhead,
+            "num_encoder_layers": num_encoder_layers,
+            "num_decoder_layers": num_decoder_layers,
+            "dim_feedforward": dim_feedforward,
+            "dropout": dropout,
+            "feature_dim": feature_dim,
+            "num_backward_decoder_layers": num_backward_decoder_layers,
+        }
+
         self._init_weights()
+
+    def get_config(self) -> dict:
+        """Return constructor arguments for checkpoint serialization."""
+        return dict(self._config)
 
     def _init_weights(self) -> None:
         for p in self.parameters():
@@ -146,6 +178,53 @@ class IntegralTransformer(nn.Module):
 
         memory = self.encode(src, depth_features, memory_key_padding_mask)
         return self.decode(tgt, memory, tgt_key_padding_mask, memory_key_padding_mask)
+
+    def forward_backward(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        depth_features: torch.Tensor,
+        bwd_src: torch.Tensor,
+        bwd_tgt: torch.Tensor,
+        bwd_depth_features: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        bwd_src_key_padding_mask: Optional[torch.Tensor] = None,
+        bwd_tgt_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward (f→F) and backward (F→f) pass for consistency training.
+
+        Returns (forward_logits, backward_logits).
+        Requires num_backward_decoder_layers > 0.
+        """
+        assert self.backward_decoder is not None, "backward decoder not configured"
+
+        fwd_logits = self.forward(
+            src, tgt, depth_features, src_key_padding_mask, tgt_key_padding_mask,
+        )
+
+        if bwd_src_key_padding_mask is not None:
+            bwd_feat_mask = torch.zeros(
+                bwd_src_key_padding_mask.size(0), 1,
+                dtype=torch.bool, device=bwd_src_key_padding_mask.device,
+            )
+            bwd_mem_mask = torch.cat([bwd_feat_mask, bwd_src_key_padding_mask], dim=1)
+        else:
+            bwd_mem_mask = None
+
+        bwd_memory = self.encode(bwd_src, bwd_depth_features, bwd_mem_mask)
+
+        bwd_tgt_emb = self.tgt_embedding(bwd_tgt) * math.sqrt(self.d_model)
+        bwd_tgt_emb = self.pos_decoder(bwd_tgt_emb)
+        bwd_causal = self._make_causal_mask(bwd_tgt.size(1), bwd_tgt.device)
+        bwd_output = self.backward_decoder(
+            bwd_tgt_emb, bwd_memory, tgt_mask=bwd_causal,
+            tgt_key_padding_mask=bwd_tgt_key_padding_mask,
+            memory_key_padding_mask=bwd_mem_mask,
+        )
+        bwd_logits = self.backward_output_proj(bwd_output)
+
+        return fwd_logits, bwd_logits
 
     @staticmethod
     def _length_penalty(length: int, alpha: float) -> float:
