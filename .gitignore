@@ -41,3 +41,4 @@ data/*.csv
 # OS
 .DS_Store
 *.log
+.gitnexus
