@@ -1,4 +1,5 @@
 """Tests for the public solve_integral API."""
+import os
 import time
 
 import pytest
@@ -37,3 +38,13 @@ class TestSolveIntegral:
     def test_custom_variable(self):
         result = solve_integral("sin(t)", var="t")
         assert result["status"] == "solved_sympy"
+
+
+class TestSampleCount:
+    def test_default_n_samples(self):
+        from integral_engine.solver import N_SAMPLES
+        assert N_SAMPLES == 40
+
+    def test_n_samples_env_parsing(self):
+        assert int("60") == 60
+        assert int(os.environ.get("INTEGRAL_N_SAMPLES", "40")) == 40
