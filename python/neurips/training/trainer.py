@@ -1,4 +1,4 @@
-"""Training loop for seq transformer and tree GNN models."""
+"""Training loop for the Tree GNN model."""
 
 from __future__ import annotations
 
@@ -103,19 +103,7 @@ def _compute_loss(
     model_type: str,
     label_smoothing: float = 0.1,
 ) -> torch.Tensor:
-    """Forward pass and loss computation for either model type."""
-    if model_type == "seq":
-        logits = model(
-            batch["src_ids"],
-            batch["tgt_ids"][:, :-1],
-            batch.get("features"),
-        )
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            batch["tgt_ids"][:, 1:].contiguous().view(-1),
-            ignore_index=PAD,
-            label_smoothing=label_smoothing,
-        )
+    """Forward pass and loss computation for the tree model."""
     if model_type == "tree":
         predicted = model(batch["input_trees"], batch["int_var"])
         return F.cross_entropy(

@@ -347,27 +347,6 @@ class TestDatasetPrecomputeE2E:
 class TestFullPipelineIntegration:
     """The complete pipeline from raw math to verified decode."""
 
-    def test_seq_training_step_produces_finite_loss(
-        self, tokenizer: IntegralTokenizer,
-    ) -> None:
-        """A single seq model training forward pass must produce finite loss."""
-        from neurips.models.seq_transformer import SeqTransformer
-        from neurips.training.trainer import _compute_loss
-
-        model = SeqTransformer()
-        model.train()
-
-        B, S = 2, 16
-        src_ids = torch.randint(3, VOCAB_SIZE, (B, S))
-        tgt_ids = torch.randint(3, VOCAB_SIZE, (B, S))
-        tgt_ids[:, -1] = EOS
-        features = torch.randn(B, FEATURE_DIM)
-
-        batch = {"src_ids": src_ids, "tgt_ids": tgt_ids, "features": features}
-        loss = _compute_loss(model, batch, model_type="seq")
-        assert loss.isfinite(), f"Loss is not finite: {loss.item()}"
-        assert loss.item() > 0, f"Loss should be positive, got {loss.item()}"
-
     def test_decode_then_verify_roundtrip(
         self, tree_model: TreeIntegrator, oracle: VerificationOracle,
     ) -> None:

@@ -7,10 +7,12 @@
 
 use rand::seq::SliceRandom;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::diff::differentiate;
 use crate::expr::{ExprNode, UnaryOp, VarId};
-use crate::gen::GenConfig;
+use crate::gen::{GenConfig, Pair};
 
 /// A skeleton is a structural template with holes for concrete expressions.
 /// Each skeleton represents a family of integrands.
@@ -370,6 +372,25 @@ pub fn generate_covered_batch(
     results.shuffle(&mut rng);
     results.truncate(total);
     results
+}
+
+/// Generate (integrand, antiderivative) pairs with coverage guarantees.
+/// Uses Rayon for parallel differentiation — this is the main entry point.
+pub fn generate_covered_pairs(
+    total: usize,
+    config: &GenConfig,
+) -> Vec<Pair> {
+    let antiderivatives = generate_covered_batch(total, config);
+    let var = config.vars.first().copied().unwrap_or(VarId::X);
+    let var_str = var.as_str();
+
+    antiderivatives
+        .into_par_iter()
+        .map(|integral| {
+            let integrand = differentiate(&integral, var_str);
+            Pair { integrand, integral }
+        })
+        .collect()
 }
 
 /// Coverage statistics for a generated batch.

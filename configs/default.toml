@@ -4,27 +4,12 @@ total_pairs = 1_500_000
 train_ratio = 0.8
 seed = 42
 
-[model.seq_transformer]
-d_model = 640
-n_heads = 10
-n_layers = 10
-d_ff = 2560
-dropout = 0.1
-vocab_size = 256
-max_seq_len = 512
-pe_type = "sinusoidal"  # "sinusoidal" | "rope" | "alibi" | "nope"
-rope_base = 10000.0
-
 [model.tree_gnn]
 node_dim = 256
 message_rounds = 8
 decoder_levels = 8
 n_heads = 8
 pe_type = "none"  # "none" | "depth_index" | "rwse" | "laplacian"
-
-[model.gating]
-enabled = false
-hidden_dim = 128
 
 [inference.mcts]
 n_simulations = 100

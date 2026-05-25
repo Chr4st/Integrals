@@ -33,7 +33,25 @@ mod python {
         m.add_function(wrap_pyfunction!(crate::env::py_env_step, m)?)?;
         m.add_function(wrap_pyfunction!(crate::env::py_env_state_features, m)?)?;
         m.add_function(wrap_pyfunction!(py_coverage_stats, m)?)?;
+        m.add_function(wrap_pyfunction!(py_generate_covered_batch, m)?)?;
         Ok(())
+    }
+
+    #[pyfunction]
+    fn py_generate_covered_batch(
+        total: usize,
+        config: &crate::gen::PyGenConfig,
+    ) -> PyResult<Vec<(PyExprTree, PyExprTree)>> {
+        let pairs = crate::gen_coverage::generate_covered_pairs(total, &config.inner);
+        Ok(pairs
+            .into_iter()
+            .map(|p| {
+                (
+                    PyExprTree { inner: p.integrand },
+                    PyExprTree { inner: p.integral },
+                )
+            })
+            .collect())
     }
 
     #[pyfunction]

@@ -1,4 +1,4 @@
-"""CLI: train seq transformer and/or tree GNN models."""
+"""CLI: train the Tree GNN model."""
 
 from __future__ import annotations
 
@@ -13,11 +13,7 @@ from _common import detect_device, load_config, load_jsonl
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train neural symbolic integration models"
-    )
-    parser.add_argument(
-        "--model", choices=["seq", "tree", "both"], default="both",
-        help="which model(s) to train",
+        description="Train neural symbolic integration model (Tree GNN)"
     )
     parser.add_argument(
         "--config", type=str, default="configs/default.toml",
@@ -42,27 +38,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _train_seq(
+def _train_tree(
     cfg: dict, train_data: list[dict], val_data: list[dict],
     device: torch.device, output_dir: Path,
 ) -> None:
-    from neurips.models.seq_transformer import SeqTransformer
+    from neurips.models.tree_gnn import TreeIntegrator
     from neurips.training.train import train
     from neurips.training.trainer import TrainConfig
 
-    seq_cfg = cfg.get("model", {}).get("seq_transformer", {})
+    tree_cfg = cfg.get("model", {}).get("tree_gnn", {})
     training_cfg = cfg.get("training", {})
 
-    model = SeqTransformer(
-        vocab_size=seq_cfg.get("vocab_size", 256),
-        d_model=seq_cfg.get("d_model", 640),
-        n_heads=seq_cfg.get("n_heads", 10),
-        n_layers=seq_cfg.get("n_layers", 10),
-        d_ff=seq_cfg.get("d_ff", 2560),
-        max_seq_len=seq_cfg.get("max_seq_len", 512),
-        dropout=seq_cfg.get("dropout", 0.1),
+    model = TreeIntegrator(
+        d=tree_cfg.get("node_dim", 256),
+        pe_type=tree_cfg.get("pe_type", "none"),
     )
-    print(f"SeqTransformer: {model.count_parameters():,} params")
+    print(f"TreeIntegrator: {model.count_parameters():,} params")
 
     config = TrainConfig(
         lr=training_cfg.get("lr", 3e-4),
@@ -71,15 +62,7 @@ def _train_seq(
         batch_size=training_cfg.get("batch_size", 256),
         grad_clip=training_cfg.get("grad_clip", 1.0),
     )
-    train(model, train_data, val_data, config, "seq", device, output_dir)
-
-
-def _train_tree(
-    cfg: dict, train_data: list[dict], val_data: list[dict],
-    device: torch.device, output_dir: Path,
-) -> None:
-    # TODO: import TreeIntegrator once phase 10-11 models are built
-    print("[skip] Tree GNN not yet implemented", file=sys.stderr)
+    train(model, train_data, val_data, config, "tree", device, output_dir)
 
 
 def main() -> None:
@@ -97,14 +80,9 @@ def main() -> None:
     print(f"Train: {len(train_data):,}  Val: {len(val_data):,}")
 
     output_dir = Path(args.output_dir)
-    models = ["seq", "tree"] if args.model == "both" else [args.model]
 
-    for m in models:
-        print(f"\n{'='*60}\nTraining {m} model\n{'='*60}")
-        if m == "seq":
-            _train_seq(cfg, train_data, val_data, device, output_dir)
-        elif m == "tree":
-            _train_tree(cfg, train_data, val_data, device, output_dir)
+    print(f"\n{'='*60}\nTraining Tree GNN model\n{'='*60}")
+    _train_tree(cfg, train_data, val_data, device, output_dir)
 
 
 if __name__ == "__main__":

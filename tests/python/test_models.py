@@ -1,33 +1,6 @@
-"""Tests for ML models (Phases 8, 10-11)."""
+"""Tests for ML models (Phases 10-11: Tree GNN)."""
 import pytest
 import torch
-
-
-class TestSeqTransformer:
-    def test_import(self):
-        from neurips.models.seq_transformer import SeqTransformer
-
-    def test_forward_shape(self):
-        from neurips.models.seq_transformer import SeqTransformer
-        model = SeqTransformer(
-            d_model=64, n_heads=4, n_layers=2, d_ff=256,
-            dropout=0.1, vocab_size=256, max_seq_len=128,
-        )
-        batch = 4
-        src = torch.randint(0, 256, (batch, 20))
-        tgt = torch.randint(0, 256, (batch, 15))
-        feats = torch.randn(batch, 344)
-        logits = model(src, tgt, feats)
-        assert logits.shape == (batch, 15, 256)
-
-    def test_param_count_small(self):
-        from neurips.models.seq_transformer import SeqTransformer
-        model = SeqTransformer(
-            d_model=64, n_heads=4, n_layers=2, d_ff=256,
-            dropout=0.1, vocab_size=256, max_seq_len=128,
-        )
-        n = sum(p.numel() for p in model.parameters())
-        assert n > 0
 
 
 class TestTreeGNN:

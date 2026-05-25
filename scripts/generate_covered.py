@@ -420,17 +420,72 @@ def _random_antiderivative() -> tuple[sp.Expr, sp.Expr] | None:
         return None
 
 
+def _try_rust_generate(total: int, output_dir: Path) -> dict | None:
+    """Try Rust FFI path — returns report dict or None if unavailable."""
+    try:
+        from neurips_core import GenConfig, generate_covered_batch
+    except ImportError:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Using Rust FFI path (Rayon parallel differentiation)")
+
+    config = GenConfig()
+    pairs_raw = generate_covered_batch(total, config)
+
+    pairs = []
+    for integrand_tree, integral_tree in pairs_raw:
+        pairs.append({
+            "integrand": str(integrand_tree),
+            "antiderivative": str(integral_tree),
+            "family": "covered",
+            "source": "rust_skeleton",
+        })
+
+    random.shuffle(pairs)
+    out_path = output_dir / "covered_pairs.jsonl"
+    with open(out_path, "w") as f:
+        for pair in pairs:
+            f.write(json.dumps(pair) + "\n")
+
+    report = {
+        "total_pairs": len(pairs),
+        "backend": "rust",
+    }
+    report_path = output_dir / "coverage_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    logger.info("Saved %d pairs to %s", len(pairs), out_path)
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Coverage-guaranteed data generation")
     parser.add_argument("--total", type=int, default=100_000)
     parser.add_argument("--output", type=Path, default=Path("data/covered"))
+    parser.add_argument("--backend", choices=["auto", "rust", "python"], default="auto")
     args = parser.parse_args()
 
     t0 = time.time()
-    report = generate_covered_dataset(args.total, args.output)
-    elapsed = time.time() - t0
 
-    logger.info("Completed in %.1fs (%.0f pairs/s)", elapsed, report["total_pairs"] / elapsed)
+    report = None
+    if args.backend in ("auto", "rust"):
+        report = _try_rust_generate(args.total, args.output)
+        if report is None and args.backend == "rust":
+            logger.error("Rust backend requested but neurips_core not available")
+            raise SystemExit(1)
+
+    if report is None:
+        logger.info("Using Python/SymPy fallback")
+        report = generate_covered_dataset(args.total, args.output)
+
+    elapsed = time.time() - t0
+    backend = report.get("backend", "python")
+    logger.info(
+        "Completed in %.1fs (%.0f pairs/s) [%s]",
+        elapsed, report["total_pairs"] / elapsed, backend,
+    )
 
 
 if __name__ == "__main__":

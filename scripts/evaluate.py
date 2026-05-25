@@ -14,8 +14,8 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate neural symbolic integration models"
     )
     parser.add_argument(
-        "--model", choices=["seq", "tree", "both"], default="both",
-        help="which model(s) to evaluate",
+        "--model", choices=["tree"], default="tree",
+        help="which model to evaluate",
     )
     parser.add_argument(
         "--checkpoint", type=str, default=None,
@@ -71,18 +71,14 @@ def main() -> None:
         run_error_analysis(cfg, test_data)
         return
 
-    models = (
-        ["seq", "tree"] if args.model == "both" else [args.model]
-    )
-    for m in models:
-        ckpt = _resolve_checkpoint(args.checkpoint, m)
-        print(f"\nEvaluating {m} from {ckpt}")
-        results = run_evaluation(m, cfg, test_data, ckpt, device)
-        if results:
-            total = results.get("total", 0)
-            solved = results.get("solved", 0)
-            rate = 100.0 * solved / max(total, 1)
-            print(f"  Overall: {solved}/{total} ({rate:.1f}%)")
+    ckpt = _resolve_checkpoint(args.checkpoint, args.model)
+    print(f"\nEvaluating {args.model} from {ckpt}")
+    results = run_evaluation(args.model, cfg, test_data, ckpt, device)
+    if results:
+        total = results.get("total", 0)
+        solved = results.get("solved", 0)
+        rate = 100.0 * solved / max(total, 1)
+        print(f"  Overall: {solved}/{total} ({rate:.1f}%)")
 
 
 if __name__ == "__main__":
