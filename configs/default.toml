@@ -1,0 +1,31 @@
+[data]
+# Paper uses 1.5M pairs; 15M is the scaling target (see plan).
+total_pairs = 1_500_000
+train_ratio = 0.8
+seed = 42
+
+[model.seq_transformer]
+d_model = 640
+n_heads = 10
+n_layers = 10
+d_ff = 2560
+dropout = 0.1
+vocab_size = 256
+max_seq_len = 512
+
+[model.tree_gnn]
+node_dim = 256
+message_rounds = 8
+decoder_levels = 8
+n_heads = 8
+
+[training]
+batch_size = 256
+lr = 3e-4
+weight_decay = 0.01
+epochs = 90
+patience = 15
+n_samples = 25
+temperature = 0.7
+top_p = 0.95
+grad_clip = 1.0

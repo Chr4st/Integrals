@@ -1,0 +1,26 @@
+[package]
+name = "neurips-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "neurips_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+python = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.23", optional = true }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.10"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench_core"
+harness = false
