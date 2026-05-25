@@ -1,6 +1,5 @@
 [data]
-# Paper uses 1.5M pairs; 15M is the scaling target (see plan).
-total_pairs = 1_500_000
+total_pairs = 40_000_000
 train_ratio = 0.8
 seed = 42
 
