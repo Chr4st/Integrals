@@ -6,7 +6,7 @@ The core idea: mathematical expressions are trees, not strings. Instead of flatt
 
 ## What the System Does
 
-**Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~2.7 million pairs/second on 8 cores.
+**Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~2.7 million pairs/second on a 14-core Apple M4 Pro.
 
 **Learning**: The model sees 1.5 million of these pairs across five types of integrals: univariate, multivariate, definite, parametric, and special-function. It learns patterns --- u-substitution looks like f(g(x))*g'(x), integration by parts has a polynomial times a transcendental, and so on.
 
@@ -97,7 +97,7 @@ The split is deliberately aggressive toward skeletons. Random generation suffers
 
 #### Why use Rust 
 
-A pure-Python implementation using SymPy generates ~7,800 pairs/second for skeleton-based expressions and ~600 pairs/second for random trees (single core). The Rust engine generates ~2.7 million pairs/second on 8 cores --- a 350x speedup on skeleton generation, 4,500x on random trees. Including JSON serialization overhead, Rust sustains ~780,000 pairs/second. All numbers benchmarked on an Apple M-series CPU. The speedup comes from specific properties of how Rust compiles to machine code and how that machine code interacts with the CPU.
+A pure-Python implementation using SymPy generates ~7,800 pairs/second for skeleton-based expressions and ~600 pairs/second for random trees (single core). The Rust engine generates ~2.7 million pairs/second on a 14-core M4 Pro --- a 350x speedup on skeleton generation, 4,500x on random trees. Including JSON serialization overhead, Rust sustains ~780,000 pairs/second. All numbers benchmarked on a 14-core Apple M4 Pro. The speedup comes from specific properties of how Rust compiles to machine code and how that machine code interacts with the CPU.
 
 **1. Memory layout and cache behavior.**
 
@@ -156,9 +156,9 @@ antiderivatives
 
 Rayon uses a work-stealing scheduler: each core has its own queue, and idle cores steal work from busy ones. This handles the variable cost of differentiating trees of different sizes (a depth-2 tree is trivial; a depth-10 tree with nested chains requires hundreds of rule applications) without any manual load balancing. No mutexes, no atomics on the hot path, no false sharing between cache lines.
 
-On an 8-core machine, this gives nearly 8x throughput. Python's GIL (Global Interpreter Lock) prevents true parallel execution of CPU-bound Python code, so SymPy can only use one core regardless of available hardware.
+On a 14-core M4 Pro, this gives up to 14x throughput. Python's GIL (Global Interpreter Lock) prevents true parallel execution of CPU-bound Python code, so SymPy can only use one core regardless of available hardware.
 
-**The combined effect:** each tree node is a cache-friendly enum (10-25x vs Python objects), no GC or refcount overhead (further 2-3x), fused simplification eliminates a separate O(n) pass, LLVM inlines and optimizes the hot loop, and Rayon parallelizes across all cores (8x on 8 cores). These multiply together to give 350-4,500x end-to-end speedup depending on expression complexity (benchmarked: Rust 2.7M pairs/sec vs Python 600-7,800 pairs/sec).
+**The combined effect:** each tree node is a cache-friendly enum (10-25x vs Python objects), no GC or refcount overhead (further 2-3x), fused simplification eliminates a separate O(n) pass, LLVM inlines and optimizes the hot loop, and Rayon parallelizes across all cores (up to 14x on a 14-core M4 Pro). These multiply together to give 350-4,500x end-to-end speedup depending on expression complexity (benchmarked: Rust 2.7M pairs/sec vs Python 600-7,800 pairs/sec).
 
 #### Expression trees (`expr/`)
 
