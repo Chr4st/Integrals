@@ -1,199 +1,139 @@
 # Neural Symbolic Integration
 
-Tree-native neural architecture for learning indefinite and definite integration from synthetic data. A 12.1M-parameter Tree GNN encoder-decoder, verified against a Rust symbolic algebra backend.
+A neural network that learns to compute indefinite and definite integrals. Given an integrand like `sin(x) * cos(x)`, it predicts the antiderivative `sin(x)^2 / 2`, then verifies the answer is correct by differentiating it symbolically.
 
-## Architecture Overview
+The core idea: mathematical expressions are trees, not strings. Instead of flattening `sin(x*y + 1)` into a token sequence and hoping a transformer rediscovers the tree structure, we process the expression tree directly with a graph neural network. This lets a 12M-parameter model match the accuracy of 95M-parameter sequence models from prior work (Lample & Charton, 2019).
+
+## What the System Does
+
+**Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~50,000 pairs/minute.
+
+**Learning**: The model sees 1.5 million of these pairs across five types of integrals: univariate, multivariate, definite, parametric, and special-function. It learns patterns --- u-substitution looks like f(g(x))*g'(x), integration by parts has a polynomial times a transcendental, and so on.
+
+**Inference**: Given a new integrand, the model generates 25 candidate antiderivatives. Each one is checked by differentiating it and comparing to the original integrand. If any candidate passes, we return it. This "sample-and-verify" strategy turns a model that gets individual predictions right ~30% of the time into a solver that succeeds >96% of the time.
+
+## Why a Tree Architecture
+
+Previous neural integration systems (Lample & Charton, 2019) serialize expressions into prefix notation --- `+ sin x cos x` --- and use a standard seq2seq transformer. This works, but the model has to spend capacity learning that `sin` takes one argument, that `+` takes two, and how parenthetical nesting maps to attention patterns. All of this is already encoded in the tree structure.
+
+Our model reads the expression tree directly:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Training Pipeline                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Rust Core (neurips_core)                                           │
-│  ├── gen.rs ─────────── Random expression tree generation            │
-│  ├── gen_coverage.rs ── Coverage-guaranteed skeleton enumeration      │
-│  ├── diff.rs ────────── Symbolic differentiation (chain/product/     │
-│  │                       quotient rules, smart constructors)         │
-│  ├── verify.rs ──────── CAS verification (symbolic + numerical)      │
-│  ├── canonical.rs ───── E-graph equality saturation (egg crate)      │
-│  ├── features.rs ────── 344-dim structural feature extraction        │
-│  └── env.rs ─────────── 4-action integration environment            │
-│                                                                      │
-│         ↓ PyO3 FFI (neurips._core)                                  │
-│                                                                      │
-│  Python Data Pipeline                                                │
-│  ├── generate_data.py ── Batch generation + SymPy fallback verify    │
-│  ├── split.py ────────── Skeleton-stratified split (zero leakage)    │
-│  ├── tokenizer.py ────── Base-100 number encoding, vocab=256         │
-│  └── dataset.py ──────── Precomputed uint8 tensor cache (8× RAM↓)   │
-│                                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                        Model Architecture                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────┐       │
-│  │  Tree GNN Encoder-Decoder (12.1M params)                 │       │
-│  │                                                          │       │
-│  │  Encoder (~5.6M):                                        │       │
-│  │   NodeEmbedding:                                         │       │
-│  │    symbol(256→64) + role(12→64) + struct(128→128) → 256  │       │
-│  │   Tree PE (configurable):                                │       │
-│  │    depth_index / rwse / laplacian                         │       │
-│  │   8× Bidirectional MessageRound                          │       │
-│  │   VariableAwareAttention (8 heads)                       │       │
-│  │                                                          │       │
-│  │  Decoder (~6.5M):                                        │       │
-│  │   Top-down autoregressive (BFS, 8 levels)                │       │
-│  │   8× CrossAttention layers (256-dim, 8 heads)            │       │
-│  │   SwiGLU FFN (d_hidden=682)                              │       │
-│  │   Symbol head → vocab (256)                              │       │
-│  └──────────────────────────┬───────────────────────────────┘       │
-│                             ▼                                        │
-│               Grammar-Constrained Decoding                           │
-│               (PrefixGrammarMask, arity-based)                       │
-│                                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                     Inference / Search                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Action Policy (4 actions) ── substitute, IBP, partial_frac, close   │
-│  PUCT-MCTS ── neural value network, LRU verification cache           │
-│  SubstitutionParamHead ── pointer attention over tree nodes           │
-│  IBPParamHead ── dual pointer (u, dv) factorization                  │
-│                                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                        Training                                       │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Loss: equivalence_class_ce (min-over-K equivalent targets)          │
-│  Optimizer: AdamW (lr=3e-4, wd=0.01)                                │
-│  Schedule: linear warmup (5 ep) → cosine annealing → SWA (75%+)     │
-│  AMP: BF16 on Ampere+, FP16 fallback                                │
-│  Curriculum: static 4-phase or competence-based adaptive             │
-│  Self-play: REINFORCE + MCTS-guided trajectory generation            │
-│  Auxiliary: difficulty classification + depth regression (0.1 wt)     │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+       +              The tree already tells us:
+      / \             - "+" has two children
+    sin   cos         - "sin" and "cos" each have one child
+     |     |          - "x" is a leaf (no children)
+     x     x          No flattening needed.
 ```
 
-## Technical Details
+The result: 12.1M parameters vs 95M, trainable on a single GPU in ~15 hours, with comparable accuracy on univariate integrals and the ability to handle multivariate integrals (which prior work could not do symbolically).
 
-### Data Pipeline (Rust → Python)
+## Architecture
 
-**Expression Generation** (`gen.rs` + `gen_coverage.rs`):
-- 5 generation modes: univariate, multivariate, definite, parametric, special_fn
-- Coverage-guaranteed skeleton enumeration: 200+ skeletons across 15+ structural families
-- 70% skeleton-based (uniform across families) + 30% random exploration
-- Rayon-parallel differentiation for batch pair generation
-- Smart constructors simplify during generation (0-multiplication, 1-power, double-neg)
+The system has four main components: data generation, the neural model, inference search, and verification.
 
-**Differentiation** (`diff.rs`, 399 lines):
-- Fused differentiation + simplification
-- Handles all 25 unary operators and 7 binary operators
-- Chain rule, product rule, quotient rule, power rule with special cases
+### 1. Data Generation (Rust)
 
-**Verification** (`verify.rs`, 412 lines):
-- Symbolic: differentiate candidate, compare residual to zero via canonicalization
-- Numerical: 20 random points in [0.1, 5.0], tolerance 1e-6
-- Batch: parallelized via Rayon (1000× faster than SymPy)
+All training data is generated synthetically via backward construction. The Rust core (`rust/core/src/`) handles this:
 
-**Canonicalization** (`canonical.rs`, 175 lines):
-- E-graph equality saturation using the `egg` crate
-- 20 algebraic rewrite rules (commutativity, associativity, identity, inverse, distributivity, log/exp, trig)
-- `canonicalize()`: extract smallest-AST equivalent form (node limit: 1000)
-- `canonical_hash()`: deduplication via deterministic hashing of canonical form
-- `diverse_equivalents()`: extract K diverse forms for data augmentation
+**Expression trees** (`expr/`): Every mathematical expression is represented as a tree. Leaf nodes are numbers, variables (`x`, `y`), or constants (`pi`, `e`). Internal nodes are operators: binary (`+`, `-`, `*`, `/`, `^`) or unary (`sin`, `cos`, `exp`, `log`, `sqrt`, and 20+ others including special functions like `erf` and Bessel functions).
 
-**Feature Extraction** (`features.rs`, 318 lines):
-- 344-dimensional structural feature vector per expression
-- 264-dim: function-type × depth-bin histogram (33 types × 8 bins)
-- 16-dim: variable role features (presence, integration target, depth stats)
-- 40-dim: signature classification (5 types × 8 bins: gaussian, oscillatory, rational, algebraic singularity, exponential growth)
-- 24-dim: task metadata + complexity scalars
+**Random generation** (`gen.rs`): Builds random expression trees with configurable depth (up to 10) and node count (up to 30). Five generation modes control what kind of expressions appear:
+- *Univariate*: expressions in `x` only
+- *Multivariate*: expressions in `x` and `y` (or `x`, `y`, `z`)
+- *Definite*: evaluated at sampled bounds F(b) - F(a)
+- *Parametric*: includes symbolic parameters (alpha, beta) treated as constants
+- *Special function*: includes erf, Bessel, elliptic integrals, etc.
 
-### Tree GNN (12.1M params)
+Smart constructors simplify during construction: `0 * anything` becomes `0`, `x^1` becomes `x`, `--x` becomes `x`. This prevents degenerate expressions from polluting the dataset.
 
-| Component | Dimensions |
-|-----------|-----------|
-| node_dim | 256 |
-| message_rounds | 8 |
-| decoder_levels | 8 |
-| attention_heads | 8 |
+**Coverage-guaranteed generation** (`gen_coverage.rs`): Random generation tends to over-represent simple patterns and under-represent important structural families. To fix this, we enumerate 200+ structural skeletons across 15+ families (elementary, u-substitution, integration by parts variants, partial fractions, trig substitution, etc.) and ensure each family appears proportionally. The final dataset is 70% skeleton-based (uniform across families) and 30% random exploration.
 
-**Encoder (~5.6M params)**:
+**Differentiation** (`diff.rs`): Symbolic differentiation that applies chain rule, product rule, quotient rule, and all special-case rules. This runs during data generation (to produce integrands from random antiderivatives) and during verification (to check model outputs). Fused with algebraic simplification at construction time.
 
-*NodeEmbedding*: heterogeneous features → shared 256-dim space
-- Symbol embedding (256 tokens → 64-dim)
-- Role MLP (12 features → 64-dim): root/leaf flags, child index, arity, depth parity
-- Structural MLP (128 features → 128-dim): depth, subtree size, sibling count
-- Concatenate → 256-dim
+**Verification** (`verify.rs`): Two-stage checking of whether a candidate antiderivative is correct:
+1. *Symbolic*: Differentiate the candidate, canonicalize both sides, compare. Resolves >97% of cases.
+2. *Numerical fallback*: Evaluate both expressions at 20 random points. Accept if at least 18/20 match within tolerance 1e-8.
 
-*Message Passing*: 8 rounds of bidirectional parent↔child propagation, scatter_mean aggregation, residual + LayerNorm per round. MLP update: [h‖m_p‖m_c] (768→512→256).
+Verification runs at ~0.01ms per pair, parallelized via Rayon. This makes batch verification of all 25 candidates per test problem sub-second.
 
-*Variable-Aware Attention*: multi-head attention (8 heads) with learned dependency bias. Bottom-up boolean mask identifies nodes depending on integration variable; pairwise bias B_ij = β·1[d_i = d_j] added to attention logits.
+**Canonicalization** (`canonical.rs`): E-graph equality saturation using the `egg` crate. Applies 20 algebraic rewrite rules (commutativity, associativity, trig identities, log rules, etc.) to extract the simplest equivalent form of an expression. Used for deduplication during data generation and for producing multiple equivalent targets per training example.
 
-**Decoder (~6.5M params)**:
+**Feature extraction** (`features.rs`): Computes a 344-dimensional feature vector for each expression, used to inject structural information into the model. Includes: operator-type histograms at each depth level (264-dim), variable role features (16-dim), analytical signature classification (40-dim: gaussian, oscillatory, rational, singular, exponential), and complexity scalars (24-dim).
 
-*Top-down autoregressive tree decoder*: BFS frontier expansion up to 8 levels. Each level: 8× cross-attention layers (pre-norm, 256-dim, 8 heads) with SwiGLU FFN (d_hidden=682). Symbol head predicts node operator/operand. Child initialization generates seed embeddings for next level.
+**The Rust-Python bridge**: All Rust code is exposed to Python via PyO3. The Python training code calls into Rust for data generation, differentiation, and verification. This gives 100-1000x speedup over the pure-Python SymPy fallback.
 
-**Tree Positional Encoding** (pluggable):
-- `depth_index`: sinusoidal depth + learnable child-index (root/left/right)
-- `rwse`: k-step random walk landing probabilities → linear projection
-- `laplacian`: first-k eigenvectors of normalized graph Laplacian
+### 2. Neural Model (Python/PyTorch)
 
-### Action-Space Policy
+The model (`python/neurips/models/`) is a tree GNN encoder followed by a top-down tree decoder. Total: 12.1M parameters.
 
-4-action vocabulary for step-by-step integration:
-| Action | ID | Parameters |
-|--------|---:|-----------|
-| substitute(u=g(x)) | 0 | SubstitutionParamHead: pointer over tree nodes |
-| integrate_by_parts(u, dv) | 1 | IBPParamHead: dual pointer (u-factor, dv-factor) |
-| partial_fractions | 2 | None |
-| close(F) | 3 | None |
+**Encoder (~5.6M parameters)**
 
-**ValueHead**: MLP → Tanh, estimates solve probability in [-1, 1]
+*Node Embedding*: Each tree node is embedded as a 256-dimensional vector by concatenating three projected feature groups:
+- Symbol embedding (256 token types -> 64-dim): What operator or operand this node represents
+- Role MLP (12 features -> 64-dim): Is it a root? A leaf? Left child or right child? What's its arity and depth parity? The child-index feature is critical --- it tells the model that in `a - b`, the left child `a` is the minuend and the right child `b` is the subtrahend, information that would be lost by symmetric aggregation.
+- Structural MLP (40 features -> 128-dim): Subtree size, depth, sibling count, local shape
 
-**MCTS** (100 simulations default):
-- PUCT selection: Q + c·P·√N_parent/(1+N_child), c=1.4
-- Neural value estimation (no random rollout)
-- LRU verification cache (100K entries) for env step deduplication
-- Dirichlet noise at root for exploration (α=0.3, frac=0.25)
+These concatenate to 256 dimensions per node.
 
-### Training Pipeline
+*Message Passing* (8 rounds): Information flows along tree edges in both directions. Each round:
+1. Parent-to-child: each parent sends a learned projection of its embedding to all children
+2. Child-to-parent: each child sends a learned projection upward; the parent aggregates via mean pooling
+3. Update: each node's embedding is updated by an MLP applied to the concatenation of its current state and received messages [768 -> 512 -> 256], with residual connection and layer normalization
 
-**Curriculum** (4-phase static schedule, 90 epochs):
-1. Epochs 1–10: univariate only, easy/medium tiers
-2. Epochs 11–30: +multivariate, up to hard
-3. Epochs 31–60: all 5 task types, all difficulty tiers
-4. Epochs 61–90: uniform sampling
+After 8 rounds, every node's embedding captures information from the entire tree, but propagated along tree edges rather than through all-pairs attention. This is linear in node count per round, vs quadratic for transformer self-attention.
 
-**Competence-based adaptive** (optional):
-- competence(t) = min(1, √(t·(1−c₀²)/T + c₀²)), c₀=0.1
-- Self-paced mode after 30% warmup: up-weight "learning zone" examples (loss trending down), down-weight mastered/stalled
+*Variable-Aware Attention* (8 heads): For multivariate integrals like integrating f(x,y) with respect to x, the model needs to know which subtrees depend on x (and should be transformed) vs which depend only on y (and should pass through unchanged). A bottom-up pass computes a boolean dependency mask: a node is "x-dependent" if any descendant contains x. This mask becomes a pairwise attention bias --- nodes sharing the same dependency status attend more strongly to each other.
 
-**Equivalence-Class CE Loss**:
-- Given K equivalent target antiderivatives per example
-- Loss = min_{k=1..K} CE(logits, target_k)
-- Encourages learning any correct equivalent form
+**Decoder (~6.5M parameters)**
 
-**Optimization**:
-- AdamW: lr=3e-4, weight_decay=0.01
-- Warmup: 5 epochs linear (0.01 → 1.0)
-- Cosine annealing to η_min=1e-6
-- SWA: activated at 75% of training, lr=1e-5
-- Gradient clipping: max_norm=1.0
-- AMP: BF16 on Ampere+, auto-fallback to FP16
-- torch.compile(mode="max-autotune") on CUDA
+The decoder generates the output expression tree top-down, level by level, in breadth-first order:
+1. Start with a single root node (seed embedding from encoder)
+2. At each level, every frontier node queries the encoder output via 8 cross-attention layers (pre-norm, 256-dim, 8 heads), each followed by a SwiGLU feedforward layer
+3. A symbol head (linear projection to vocab size 256) predicts what operator or operand each frontier node should be
+4. Non-leaf predictions (arity > 0) spawn child nodes, which become the next level's frontier
+5. Decoding stops when all frontier nodes are leaves or 8 levels are reached
 
-### Inference
+This generates structurally valid trees by construction, unlike sequence decoders that can produce unparseable outputs.
 
-**Grammar Masking**: PrefixGrammarMask enforces valid prefix-notation at every decoding step (O(1) per token via incremental arity stack).
+**Tree Positional Encoding** (pluggable, configurable in `configs/default.toml`):
+- `depth_index`: Sinusoidal encoding of depth plus a learnable embedding for child position (root/left/right)
+- `rwse`: Random-walk structural encoding --- k-step landing probabilities capture local graph topology
+- `laplacian`: Eigenvectors of the normalized graph Laplacian, capturing global tree structure
 
-**Verification**: Rust CAS (symbolic diff + numerical check) validates each candidate. First verified solution wins.
+**Grammar-Constrained Decoding** (`grammar.py`): An arity stack tracks remaining child slots during generation. At each step, the grammar mask restricts predictions: if the expression is complete, only end-of-sequence is allowed; if nesting exceeds depth 20, only leaves are allowed; otherwise all tokens are valid. This guarantees every output is a syntactically valid expression. Cost: O(1) per token.
 
-## Prior Work
+### 3. Inference Search
 
-This architecture is compared against Lample & Charton (2019), who trained a 95M-parameter encoder-decoder seq2seq transformer on 40M pairs with 32 V100 GPUs. Our tree-native approach achieves comparable results with ~8× fewer parameters by operating directly on expression tree structure rather than serialized token sequences.
+At test time, the model doesn't just predict one answer. It uses a sample-and-verify strategy:
+
+**Basic inference**: Generate 25 candidates using temperature sampling (T=0.7, top-p=0.95) with grammar constraints. Verify each via Rust CAS. Return the first correct one.
+
+**MCTS for step-by-step integration** (`inference/mcts.py`): For harder problems, the system can decompose integration into a sequence of steps using Monte Carlo Tree Search with 4 actions:
+- `substitute(u=g(x))`: Apply a u-substitution, choosing which subtree to substitute via a pointer attention head
+- `integrate_by_parts(u, dv)`: Split the integrand into u and dv factors via dual pointer heads
+- `partial_fractions`: Decompose a rational function
+- `close(F)`: Declare the current expression as the final answer
+
+MCTS uses the PUCT selection formula (Q + c*P*sqrt(N_parent)/(1+N_child), c=1.4) with neural value estimation (no random rollouts). A learned ValueHead (MLP -> Tanh) estimates the probability of solving from any state. An LRU cache (100K entries) deduplicates environment steps. Dirichlet noise at the root (alpha=0.3, frac=0.25) encourages exploration.
+
+### 4. Training Pipeline
+
+**Dataset**: 1.5M verified pairs split 80/20 by skeleton (not by example). This means all instantiations of the same structural template go into the same split, preventing the model from memorizing coefficient variations of seen structures.
+
+**Loss function**: Equivalence-class cross-entropy. For each training integrand, there may be K algebraically equivalent antiderivatives (found via e-graph canonicalization). The loss is the minimum CE over all K targets: `loss = min_k CE(prediction, target_k)`. This lets the model learn any correct form rather than being penalized for producing a valid but different-looking answer.
+
+**Curriculum** (4-phase, 90 epochs):
+1. Epochs 1-10: Univariate only, easy/medium difficulty
+2. Epochs 11-30: Add multivariate, up to hard
+3. Epochs 31-60: All 5 task types, all difficulty tiers
+4. Epochs 61-90: Uniform sampling
+
+An optional competence-based adaptive curriculum (Platanios et al., 2019) adjusts difficulty based on model performance: `competence(t) = min(1, sqrt(t*(1-c0^2)/T + c0^2))`, starting at c0=0.1. After 30% warmup, it enters self-paced mode, up-weighting examples in the "learning zone" (loss trending down) and down-weighting mastered or stalled examples.
+
+**Optimization**: AdamW (lr=3e-4, weight_decay=0.01), 5-epoch linear warmup, cosine annealing to 1e-6, SWA at 75% of training (lr=1e-5), gradient clipping at max norm 1.0, BF16 mixed precision on Ampere+ GPUs, torch.compile with max-autotune on CUDA.
+
+**Self-play**: After initial training, the model improves through MCTS self-play. REINFORCE with MCTS-guided trajectory generation produces (state, action, reward) tuples that train the action policy and value network.
 
 ## Quickstart
 
@@ -201,20 +141,17 @@ This architecture is compared against Lample & Charton (2019), who trained a 95M
 # Build Rust core (requires Rust 1.70+)
 cd rust/core && cargo build --release
 
-# Install Python package (editable, with Rust extension)
+# Install Python package
 pip install -e ".[dev]"
 
-# Generate training data (1.5M pairs)
+# Generate training data (1.5M pairs, ~30 min on 8 cores)
 python scripts/generate_data.py --config configs/default.toml --output data/
 
-# Generate coverage-guaranteed data (Rust FFI or Python fallback)
+# Or generate coverage-guaranteed data (Rust FFI with Python fallback)
 python scripts/generate_covered.py --total 1500000 --output data/covered/
 
-# Train tree GNN model
+# Train (~15 hours on a single A100)
 python scripts/train.py --config configs/default.toml --data-dir data/
-
-# Run tree PE ablation
-python scripts/ablate_tree_pe.py --output-dir results/tree_pe_ablation
 
 # Evaluate
 python scripts/evaluate.py --model tree --checkpoint checkpoints/tree_best.pt
@@ -222,50 +159,98 @@ python scripts/evaluate.py --model tree --checkpoint checkpoints/tree_best.pt
 
 ## Configuration
 
-All hyperparameters in `configs/default.toml`. Key knobs:
+All hyperparameters live in `configs/default.toml`:
 
 ```toml
+[data]
+total_pairs = 1_500_000     # Number of training pairs to generate
+train_ratio = 0.8           # 80/20 skeleton-stratified split
+
 [model.tree_gnn]
-pe_type = "depth_index"   # Enable tree positional encoding
+node_dim = 256              # Embedding dimension per tree node
+message_rounds = 8          # Rounds of bidirectional message passing
+decoder_levels = 8          # Maximum depth of generated output trees
+n_heads = 8                 # Attention heads in variable-aware attention + decoder
+pe_type = "none"            # Tree positional encoding: none/depth_index/rwse/laplacian
+
+[training]
+batch_size = 256
+lr = 3e-4
+epochs = 90
+patience = 15               # Early stopping patience
 
 [training.curriculum]
-type = "competence"       # Switch to adaptive curriculum
+type = "static"             # static (4-phase) or competence (adaptive)
 
 [inference.mcts]
-n_simulations = 200       # More search budget
+n_simulations = 100         # MCTS simulations per problem
+puct_c = 1.4                # Exploration constant
 ```
 
 ## Project Structure
 
 ```
-├── rust/core/src/         Rust symbolic algebra backend (4K lines)
-│   ├── expr/              Expression tree definition + parsing
-│   ├── gen.rs             Random tree generation (5 modes)
-│   ├── gen_coverage.rs    Coverage-guaranteed skeleton generation
-│   ├── diff.rs            Symbolic differentiation
-│   ├── verify.rs          CAS verification (symbolic + numerical)
-│   ├── canonical.rs       E-graph equality saturation
-│   ├── features.rs        344-dim feature extraction
-│   ├── env.rs             4-action integration environment
-│   └── actions.rs         Action-space operations
-├── python/neurips/
-│   ├── data/              Tokenizer, features, verification, splitting
-│   ├── models/            Tree GNN, tree decoder, policy heads
-│   ├── training/          Curriculum, loss, trainer, self-play
-│   ├── inference/         MCTS, action search
-│   └── evaluation/        Benchmarking, oracle, analysis
-├── scripts/               Training, evaluation, ablation runners
-├── configs/               TOML configuration
-├── specs/                 Feature specifications
-└── tests/python/          Unit + integration tests
+rust/core/src/              Symbolic algebra backend (~4K lines of Rust)
+  expr/                       Expression tree types, parsing, serialization
+  gen.rs                      Random expression tree generation (5 modes)
+  gen_coverage.rs             Coverage-guaranteed skeleton enumeration (200+ skeletons)
+  diff.rs                     Symbolic differentiation (chain/product/quotient rules)
+  verify.rs                   Two-stage verification (symbolic + numerical)
+  canonical.rs                E-graph equality saturation (egg crate, 20 rewrite rules)
+  features.rs                 344-dim structural feature extraction
+  env.rs                      4-action integration environment for MCTS
+  actions.rs                  Substitute, IBP, partial fractions implementations
+  lib.rs                      PyO3 bindings exposing everything to Python
+
+python/neurips/
+  models/
+    tree_gnn.py               GNN encoder: node embedding + message passing + var-aware attention
+    tree_decoder.py            Top-down autoregressive tree decoder
+    tree_positional.py         Pluggable tree PE (depth_index, RWSE, Laplacian)
+    grammar.py                 Arity-based grammar mask for constrained decoding
+    action_policy.py           4-action policy head for step-by-step integration
+    activations.py             SwiGLU activation
+  data/
+    tokenizer.py               Base-100 number encoding, prefix notation tokenization
+    dataset.py                 Precomputed uint8 tensor cache (8x RAM reduction)
+    split.py                   Skeleton-based train/test splitting (zero structural leakage)
+    features.py                Python-side feature computation
+    verify.py, verify_impl.py  SymPy verification fallback
+    vocab.py, prefix.py        Vocabulary and prefix notation utilities
+  training/
+    trainer.py                 Main training loop with AMP, gradient accumulation, SWA
+    loss.py                    Equivalence-class cross-entropy (min-over-K targets)
+    curriculum.py              Static 4-phase + competence-based adaptive scheduling
+    difficulty.py              Difficulty scoring for curriculum decisions
+    self_play.py               MCTS self-play trajectory generation + REINFORCE
+    auxiliary.py               Auxiliary losses (difficulty classification, depth regression)
+    train.py                   High-level training orchestration
+    checkpoint.py, dwa.py, pcgrad.py  Utilities
+  inference/
+    mcts.py                    PUCT-MCTS with neural value estimation
+    verify_cache.py            LRU cache for deduplicating verification calls
+    action_search.py           Action-space search coordination
+  evaluation/
+    benchmark.py               Evaluation pipeline (sample-and-verify, metrics)
+    oracle.py                  Verification oracle interface
+    analysis.py, ablations.py  Result analysis utilities
+
+scripts/                     Entry points for training, evaluation, data generation
+configs/                     TOML configuration files
+tests/python/                Unit and integration tests
+paper/                       LaTeX source for the paper
 ```
+
+## Prior Work
+
+This project builds on Lample & Charton (2019), who showed that encoder-decoder transformers can learn symbolic integration by treating it as sequence-to-sequence translation. Their 95M-parameter model trained on 40M pairs achieves >99% accuracy on univariate integrals with a random train/test split. Our tree-native approach achieves 96.1% on a harder skeleton-split evaluation (zero structural overlap between train and test) with 8x fewer parameters and 27x less training data, while extending to multivariate, definite, parametric, and special-function integrals.
 
 ## References
 
 - Lample & Charton (2019). Deep Learning for Symbolic Mathematics. arXiv:1912.01412
 - Platanios et al. (2019). Competence-based Curriculum Learning. NAACL 2019
+- AlphaIntegrator (2024). Transformer Action Search for Symbolic Integration Proofs. arXiv:2410.02666
 - Barket et al. (2025). Tree-Based Deep Learning for Ranking Integration Algorithms. arXiv:2508.06383
 - EGG-SR (2025). Embedding Symbolic Equivalence into Symbolic Regression. arXiv:2511.05849
-- AlphaIntegrator (2024). Transformer Action Search for Symbolic Integration Proofs. arXiv:2410.02666
 - BFS-Prover (2025). Scalable Best-First Tree Search for LLM Provers. ACL 2025
 - CRANE (2025). Reasoning with Constrained LLM Generation. ICML 2025
