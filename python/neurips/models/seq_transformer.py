@@ -1,46 +1,45 @@
-"""Sequence Transformer — encoder-decoder baseline (~95M params)."""
+"""Sequence Transformer — encoder-decoder baseline (~95M params).
+
+Supports pluggable positional encoding (sinusoidal, RoPE, ALiBi, NoPE)
+and FlashAttention-2 via PyTorch 2.x SDPA backend.
+"""
 
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from neurips.models.grammar import FEAT_ID
+from neurips.models.positional import (
+    ALiBiSlopes,
+    PEType,
+    RotaryEmbedding,
+    apply_rotary,
+    build_pe,
+)
 
-# ── Sinusoidal positional encoding ───────────────────────────────────
-
-
-class SinusoidalPE(nn.Module):
-    """Fixed sinusoidal positional encoding (Vaswani et al.)."""
-
-    def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(max_len).unsqueeze(1).float()
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10_000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))  # [1, max_len, d_model]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """*x*: [batch, seq_len, d_model]."""
-        return self.dropout(x + self.pe[:, : x.size(1)])
-
-
-# ── Encoder ──────────────────────────────────────────────────────────
-
-# Feature dimension: 344 (264 depth-encoded heads + 16 var + 40 sig + 24 task).
 _FEAT_DIM = 344
 
 
+def _enable_flash_sdpa() -> None:
+    """Enable FlashAttention-2 backend if available."""
+    if hasattr(torch.backends, "cuda"):
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        except Exception:
+            pass
+
+
+_enable_flash_sdpa()
+
+
 class SeqEncoder(nn.Module):
-    """Token embedding + sinusoidal PE + feature injection + transformer."""
+    """Token embedding + pluggable PE + feature injection + transformer."""
 
     def __init__(
         self,
@@ -51,12 +50,26 @@ class SeqEncoder(nn.Module):
         d_ff: int = 2560,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        pe_type: PEType = "sinusoidal",
+        rope_base: float = 10_000.0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.pe_type = pe_type
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_enc = SinusoidalPE(d_model, max_seq_len, dropout)
+        self.pos_enc = build_pe(pe_type, d_model, max_seq_len, dropout, n_heads, rope_base)
         self.feat_proj = nn.Linear(_FEAT_DIM, d_model)
+
+        if pe_type == "rope":
+            self.rotary = RotaryEmbedding(d_model // n_heads, max_seq_len, rope_base)
+        else:
+            self.rotary = None
+
+        if pe_type == "alibi":
+            self.alibi = ALiBiSlopes(n_heads)
+        else:
+            self.alibi = None
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -74,28 +87,15 @@ class SeqEncoder(nn.Module):
         features: torch.Tensor | None = None,
         src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            src_ids: [batch, src_len] token ids.
-            features: [batch, feat_dim] numeric features (injected at first
-                      position whose token id == FEAT_ID, i.e. id 3).
-            src_key_padding_mask: [batch, src_len] True → ignore.
-        Returns:
-            Encoder hidden states [batch, src_len, d_model].
-        """
         x = self.token_emb(src_ids) * math.sqrt(self.d_model)
         x = self.pos_enc(x)
 
         if features is not None:
-            feat_emb = self.feat_proj(features)  # [batch, d_model]
-            # Inject at every position whose id == FEAT_ID.
-            feat_mask = (src_ids == FEAT_ID).unsqueeze(-1)  # [B, L, 1] bool
+            feat_emb = self.feat_proj(features)
+            feat_mask = (src_ids == FEAT_ID).unsqueeze(-1)
             x = x + feat_emb.unsqueeze(1) * feat_mask.to(x.dtype)
 
         return self.layers(x, src_key_padding_mask=src_key_padding_mask)
-
-
-# ── Decoder ──────────────────────────────────────────────────────────
 
 
 class SeqDecoder(nn.Module):
@@ -110,11 +110,25 @@ class SeqDecoder(nn.Module):
         d_ff: int = 2560,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        pe_type: PEType = "sinusoidal",
+        rope_base: float = 10_000.0,
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.pe_type = pe_type
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_enc = SinusoidalPE(d_model, max_seq_len, dropout)
+        self.pos_enc = build_pe(pe_type, d_model, max_seq_len, dropout, n_heads, rope_base)
+
+        if pe_type == "rope":
+            self.rotary = RotaryEmbedding(d_model // n_heads, max_seq_len, rope_base)
+        else:
+            self.rotary = None
+
+        if pe_type == "alibi":
+            self.alibi = ALiBiSlopes(n_heads)
+        else:
+            self.alibi = None
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
@@ -134,15 +148,6 @@ class SeqDecoder(nn.Module):
         tgt_mask: torch.Tensor | None = None,
         memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            tgt_ids: [batch, tgt_len] target token ids.
-            memory: [batch, src_len, d_model] encoder output.
-            tgt_mask: [tgt_len, tgt_len] causal mask.
-            memory_key_padding_mask: [batch, src_len].
-        Returns:
-            Logits [batch, tgt_len, vocab_size].
-        """
         x = self.token_emb(tgt_ids) * math.sqrt(self.d_model)
         x = self.pos_enc(x)
 
@@ -161,9 +166,6 @@ class SeqDecoder(nn.Module):
         return self.output_proj(x)
 
 
-# ── Full model ───────────────────────────────────────────────────────
-
-
 class SeqTransformer(nn.Module):
     """Encoder-decoder transformer for prefix-notation sequences."""
 
@@ -176,16 +178,19 @@ class SeqTransformer(nn.Module):
         d_ff: int = 2560,
         max_seq_len: int = 512,
         dropout: float = 0.1,
+        pe_type: PEType = "sinusoidal",
+        rope_base: float = 10_000.0,
     ) -> None:
         super().__init__()
+        self.pe_type = pe_type
         self.encoder = SeqEncoder(
-            vocab_size, d_model, n_heads, n_layers, d_ff, max_seq_len, dropout
+            vocab_size, d_model, n_heads, n_layers, d_ff, max_seq_len, dropout,
+            pe_type, rope_base,
         )
         self.decoder = SeqDecoder(
-            vocab_size, d_model, n_heads, n_layers, d_ff, max_seq_len, dropout
+            vocab_size, d_model, n_heads, n_layers, d_ff, max_seq_len, dropout,
+            pe_type, rope_base,
         )
-        # Weight tying: share embeddings between encoder and decoder,
-        # and tie output projection to decoder embedding (GPT-2/T5 style).
         self.decoder.token_emb.weight = self.encoder.token_emb.weight
         self.decoder.output_proj.weight = self.decoder.token_emb.weight
 
@@ -197,19 +202,10 @@ class SeqTransformer(nn.Module):
         src_key_padding_mask: torch.Tensor | None = None,
         memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            src_ids: [batch, src_len].
-            tgt_ids: [batch, tgt_len].
-            features: [batch, 344] optional numeric features.
-        Returns:
-            Logits [batch, tgt_len, vocab_size].
-        """
         memory = self.encoder(src_ids, features, src_key_padding_mask)
         return self.decoder(
             tgt_ids, memory, memory_key_padding_mask=memory_key_padding_mask
         )
 
     def count_parameters(self) -> int:
-        """Total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

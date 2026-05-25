@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-timeout"]
+flash = ["flash-attn>=2.5"]
+all = ["flash-attn>=2.5", "scipy", "pandas", "pyarrow"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
