@@ -298,15 +298,15 @@ def generate_covered_dataset(
     """Generate a dataset with guaranteed coverage of all skeleton families.
 
     Distribution:
-      - 70% from skeleton enumeration (uniform across families)
-      - 30% from random SymPy expressions (exploration)
+      - 90% from skeleton enumeration (uniform across families)
+      - 10% from random SymPy expressions (exploration)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     families = list(SKELETON_FAMILIES.keys())
     n_families = len(families)
     logger.info("Skeleton families: %d", n_families)
 
-    covered_budget = int(total * 0.70)
+    covered_budget = int(total * 0.90)
     random_budget = total - covered_budget
     per_family = max(covered_budget // n_families, 1)
 

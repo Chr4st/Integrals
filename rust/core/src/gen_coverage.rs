@@ -346,8 +346,8 @@ pub fn generate_covered_batch(
     let skeletons = enumerate_skeletons();
     let n_families = skeletons.len();
 
-    // Allocate: 70% to skeleton coverage, 30% to random exploration
-    let covered_budget = (total * 70) / 100;
+    // Allocate: 90% to skeleton coverage, 10% to random exploration
+    let covered_budget = (total * 90) / 100;
     let random_budget = total - covered_budget;
     let per_family = std::cmp::max(covered_budget / n_families, 1);
 
@@ -406,15 +406,15 @@ pub struct CoverageStats {
 pub fn coverage_stats(total: usize) -> CoverageStats {
     let skeletons = enumerate_skeletons();
     let n_families = skeletons.len();
-    let covered_budget = (total * 70) / 100;
+    let covered_budget = (total * 90) / 100;
     let per_family = std::cmp::max(covered_budget / n_families, 1);
 
     CoverageStats {
         total_skeletons: n_families,
         total_generated: total,
         per_family_target: per_family,
-        skeleton_fraction: 0.70,
-        random_fraction: 0.30,
+        skeleton_fraction: 0.90,
+        random_fraction: 0.10,
     }
 }
 
