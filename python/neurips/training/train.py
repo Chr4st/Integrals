@@ -17,10 +17,12 @@ logger = logging.getLogger(__name__)
 
 from neurips.models.grammar import move_grammar_masks_to
 from neurips.training.curriculum import (
+    CompetenceCurriculum,
     CurriculumScheduler,
     build_index_maps,
     weighted_sample_indices,
 )
+from neurips.training.difficulty import batch_difficulty
 from neurips.training.checkpoint import save_checkpoint, save_snapshot, snapshot_state
 from neurips.training.trainer import TrainConfig, train_epoch, validate
 
@@ -81,6 +83,15 @@ def train(
     use_amp = config.use_amp and device.type == "cuda"
 
     curriculum = CurriculumScheduler()
+
+    # Competence-based curriculum (optional — activated via config).
+    use_competence = config.curriculum_type == "competence"
+    competence_curriculum: CompetenceCurriculum | None = None
+    if use_competence:
+        total_steps = config.epochs * (len(train_data) // config.batch_size)
+        competence_curriculum = CompetenceCurriculum(total_steps=total_steps)
+        logger.info("Using competence-based adaptive curriculum (T=%d)", total_steps)
+
     best_val_loss = float("inf")
     patience_counter = 0
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}

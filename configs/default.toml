@@ -12,12 +12,30 @@ d_ff = 2560
 dropout = 0.1
 vocab_size = 256
 max_seq_len = 512
+pe_type = "sinusoidal"  # "sinusoidal" | "rope" | "alibi" | "nope"
+rope_base = 10000.0
 
 [model.tree_gnn]
 node_dim = 256
 message_rounds = 8
 decoder_levels = 8
 n_heads = 8
+pe_type = "none"  # "none" | "depth_index" | "rwse" | "laplacian"
+
+[model.gating]
+enabled = false
+hidden_dim = 128
+
+[inference.mcts]
+n_simulations = 100
+puct_c = 1.4
+max_depth = 10
+cache_size = 100000
+
+[training.curriculum]
+type = "static"  # "static" | "competence" | "self_paced"
+c_0 = 0.1
+self_paced_start = 0.3
 
 [training]
 batch_size = 256

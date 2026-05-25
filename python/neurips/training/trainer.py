@@ -49,6 +49,7 @@ class TrainConfig:
     swa_lr: float = 1e-5
     use_pcgrad: bool = False
     aux_weight: float = 0.1
+    curriculum_type: str = "static"
 
 
 def train_step(

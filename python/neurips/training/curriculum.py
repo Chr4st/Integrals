@@ -1,8 +1,16 @@
-"""Curriculum learning scheduler for staged training."""
+"""Curriculum learning scheduler for staged training.
+
+Supports static (original) and competence-based adaptive scheduling.
+"""
 
 from __future__ import annotations
 
+import math
 import random
+from collections import deque
+from typing import Literal
+
+import numpy as np
 
 
 class CurriculumScheduler:
@@ -167,3 +175,111 @@ def weighted_sample_indices(
         if pool:
             sampled.append(random.choice(pool))
     return sampled
+
+
+# ---------------------------------------------------------------------------
+# Competence-based adaptive curriculum (Platanios et al. 2019)
+# ---------------------------------------------------------------------------
+
+
+class CompetenceCurriculum:
+    """Adaptive curriculum using a competence function.
+
+    competence(t) = min(1, sqrt(t * (1 - c_0^2) / T + c_0^2))
+
+    At each step, only examples with difficulty <= competence are eligible.
+    """
+
+    def __init__(
+        self,
+        total_steps: int,
+        c_0: float = 0.1,
+        self_paced_start: float = 0.3,
+        loss_window: int = 3,
+    ) -> None:
+        self._total_steps = total_steps
+        self._c_0 = c_0
+        self._self_paced_start = self_paced_start
+        self._loss_window = loss_window
+        self._step = 0
+        self._per_example_losses: dict[int, deque[float]] = {}
+
+    def competence(self, step: int | None = None) -> float:
+        """Current competence level in [c_0, 1.0]."""
+        t = step if step is not None else self._step
+        return min(1.0, math.sqrt(
+            t * (1.0 - self._c_0 ** 2) / self._total_steps + self._c_0 ** 2
+        ))
+
+    def step(self) -> None:
+        """Advance internal step counter."""
+        self._step += 1
+
+    @property
+    def is_self_paced(self) -> bool:
+        """Whether self-paced mode is active (after warm-up fraction)."""
+        return self._step >= self._total_steps * self._self_paced_start
+
+    def record_loss(self, example_idx: int, loss: float) -> None:
+        """Record per-example loss for self-paced scheduling."""
+        if example_idx not in self._per_example_losses:
+            self._per_example_losses[example_idx] = deque(maxlen=self._loss_window)
+        self._per_example_losses[example_idx].append(loss)
+
+    def get_sampling_weights(
+        self, indices: list[int], difficulties: np.ndarray
+    ) -> np.ndarray:
+        """Compute sampling weights based on competence and self-pacing.
+
+        Args:
+            indices: dataset indices to consider.
+            difficulties: [len(indices)] difficulty scores in [0, 1].
+
+        Returns:
+            [len(indices)] sampling weights (unnormalized).
+        """
+        comp = self.competence()
+        weights = np.zeros(len(indices), dtype=np.float32)
+
+        for i, (idx, diff) in enumerate(zip(indices, difficulties)):
+            if diff > comp:
+                continue
+
+            if not self.is_self_paced:
+                weights[i] = 1.0
+                continue
+
+            history = self._per_example_losses.get(idx)
+            if history is None or len(history) < 2:
+                weights[i] = 1.0
+                continue
+
+            recent = list(history)
+            avg_loss = sum(recent) / len(recent)
+            trend = recent[-1] - recent[0]
+
+            if avg_loss < 0.1:
+                weights[i] = 0.2  # mastered
+            elif trend < -0.01:
+                weights[i] = 2.0  # learning zone
+            else:
+                weights[i] = 0.5  # too hard / stalled
+
+        total = weights.sum()
+        if total < 1e-8:
+            return np.ones(len(indices), dtype=np.float32)
+        return weights
+
+    def state_dict(self) -> dict:
+        """Serialize curriculum state for checkpointing."""
+        return {
+            "step": self._step,
+            "total_steps": self._total_steps,
+            "c_0": self._c_0,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore curriculum state from checkpoint."""
+        self._step = state["step"]
+        self._total_steps = state["total_steps"]
+        self._c_0 = state["c_0"]
