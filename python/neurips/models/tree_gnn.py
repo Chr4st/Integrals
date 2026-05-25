@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from .tree_decoder import TreeDecoder, TreeNode
+from .tree_positional import TreePEType, build_tree_pe
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -192,11 +193,12 @@ class VariableAwareAttention(nn.Module):
 
 
 class TreeIntegrator(nn.Module):
-    """End-to-end tree-based integrator: embed → message-pass → attend → decode."""
+    """End-to-end tree-based integrator: embed → PE → message-pass → attend → decode."""
 
-    def __init__(self, d: int = _D_NODE) -> None:
+    def __init__(self, d: int = _D_NODE, pe_type: TreePEType = "none") -> None:
         super().__init__()
         self.node_emb = NodeEmbedding()
+        self.tree_pe = build_tree_pe(pe_type, d)
         self.message_pass = TreeMessagePassing(d)
         self.var_attn = VariableAwareAttention(d)
         self.decoder = TreeDecoder(d)
@@ -208,6 +210,8 @@ class TreeIntegrator(nn.Module):
         struct_features: torch.Tensor,
         edge_index: torch.Tensor,
         dep_mask: torch.Tensor | None = None,
+        depths: torch.Tensor | None = None,
+        child_indices: torch.Tensor | None = None,
     ) -> list[TreeNode]:
         """
         Args:
@@ -216,13 +220,24 @@ class TreeIntegrator(nn.Module):
             struct_features: [N, 40].
             edge_index: [2, E] parent→child edges.
             dep_mask: [N, N] variable-dependency group mask.
+            depths: [N] integer node depths (for depth_index PE).
+            child_indices: [N] integer child positions (for depth_index PE).
         Returns:
             List of TreeNode from greedy decoding.
         """
         h = self.node_emb(symbol_ids, role_features, struct_features)
+
+        if self.tree_pe is not None:
+            from .tree_positional import DepthIndexPE, RWSE, LaplacianPE
+
+            if isinstance(self.tree_pe, DepthIndexPE):
+                if depths is not None and child_indices is not None:
+                    h = h + self.tree_pe(depths, child_indices)
+            elif isinstance(self.tree_pe, (RWSE, LaplacianPE)):
+                h = h + self.tree_pe(edge_index, symbol_ids.size(0))
+
         h = self.message_pass(h, edge_index)
         h = self.var_attn(h, dep_mask)
-        # h is [N, d]; decoder expects [1, N, d].
         encoder_out = h.unsqueeze(0) if h.dim() == 2 else h
         return self.decoder.decode_tree(encoder_out)
 
