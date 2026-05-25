@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod canonical;
 pub mod compare;
 pub mod diff;
 pub mod env;
