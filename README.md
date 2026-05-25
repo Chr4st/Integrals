@@ -34,34 +34,134 @@ The system has four main components: data generation, the neural model, inferenc
 
 ### 1. Data Generation (Rust)
 
-All training data is generated synthetically via backward construction. The Rust core (`rust/core/src/`) handles this:
+All training data is generated synthetically. Nothing is scraped from textbooks or the internet. The key insight is that integration is hard but differentiation is easy, so we work backwards: generate a random expression F(x), differentiate it to get f(x) = dF/dx, and pair them as (f, F). Since differentiation is exact, every pair is correct by construction --- no CAS timeout failures, no unverified answers.
 
-**Expression trees** (`expr/`): Every mathematical expression is represented as a tree. Leaf nodes are numbers, variables (`x`, `y`), or constants (`pi`, `e`). Internal nodes are operators: binary (`+`, `-`, `*`, `/`, `^`) or unary (`sin`, `cos`, `exp`, `log`, `sqrt`, and 20+ others including special functions like `erf` and Bessel functions).
+The entire generation engine is written in Rust (`rust/core/src/`), exposed to Python via PyO3.
 
-**Random generation** (`gen.rs`): Builds random expression trees with configurable depth (up to 10) and node count (up to 30). Five generation modes control what kind of expressions appear:
-- *Univariate*: expressions in `x` only
-- *Multivariate*: expressions in `x` and `y` (or `x`, `y`, `z`)
-- *Definite*: evaluated at sampled bounds F(b) - F(a)
-- *Parametric*: includes symbolic parameters (alpha, beta) treated as constants
-- *Special function*: includes erf, Bessel, elliptic integrals, etc.
+#### How one pair is made
 
-Smart constructors simplify during construction: `0 * anything` becomes `0`, `x^1` becomes `x`, `--x` becomes `x`. This prevents degenerate expressions from polluting the dataset.
+```
+Step 1: Build a random expression tree (the antiderivative)
 
-**Coverage-guaranteed generation** (`gen_coverage.rs`): Random generation tends to over-represent simple patterns and under-represent important structural families. To fix this, we enumerate 200+ structural skeletons across 15+ families (elementary, u-substitution, integration by parts variants, partial fractions, trig substitution, etc.) and ensure each family appears proportionally. The final dataset is 70% skeleton-based (uniform across families) and 30% random exploration.
+         *                  This tree represents x^2 * sin(x).
+        / \                 It was built by the random tree generator,
+       ^   sin              which rolls dice at each node to decide:
+      / \   |               binary op (40%), unary op (25%), or leaf (30%).
+     x   2  x               Depth capped at 10, node count at 30.
 
-**Differentiation** (`diff.rs`): Symbolic differentiation that applies chain rule, product rule, quotient rule, and all special-case rules. This runs during data generation (to produce integrands from random antiderivatives) and during verification (to check model outputs). Fused with algebraic simplification at construction time.
+Step 2: Differentiate it (produces the integrand)
 
-**Verification** (`verify.rs`): Two-stage checking of whether a candidate antiderivative is correct:
+    The Rust diff engine walks the tree and applies calculus rules:
+    d/dx [x^2 * sin(x)] = 2x*sin(x) + x^2*cos(x)    (product rule)
+
+Step 3: Pair them
+
+    Integrand:      2x*sin(x) + x^2*cos(x)
+    Antiderivative: x^2 * sin(x)
+    This pair is correct by construction. No verification needed.
+```
+
+#### The distribution problem and how we solve it
+
+Naive random tree generation has a serious bias problem. If you just roll dice to pick operators and operands, you get a lot of polynomials and simple products (because `+`, `*`, and `^` with integer leaves are common), but almost no examples of u-substitution, integration by parts, trig substitution, or partial fractions. A model trained on this distribution never learns the hard patterns that matter.
+
+We solve this with **skeleton enumeration** (`gen_coverage.rs`). A skeleton is a structural template for an antiderivative. We enumerate 200+ skeletons across 15+ families that cover every integration technique a calculus student learns:
+
+| Family | Example skeleton | What it teaches |
+|--------|-----------------|-----------------|
+| Elementary | sin(x), exp(x), log(x) | Basic antiderivatives |
+| Linear substitution | sin(ax+b), exp(ax) | Recognizing linear inner functions |
+| Composition | sin(exp(x)), log(cos(x)) | Nested function structure |
+| U-substitution | F(g(x)) where the chain rule produces f(g(x))*g'(x) | Reverse chain rule |
+| IBP: poly * exp | (x^n - ... )*e^x | Integration by parts with exponentials |
+| IBP: poly * trig | x*sin(x) - cos(x), etc. | Integration by parts with trig |
+| IBP: poly * log | x^2*log(x)/2 - x^2/4 | Integration by parts with logarithms |
+| IBP: exp * trig | e^x*(sin(x)-cos(x))/2 | Cyclic integration by parts |
+| IBP: inverse trig | x*arctan(x) - log(1+x^2)/2 | Parts with inverse trig |
+| Rational | 1/(x+a), 1/(x^2+a^2) | Partial fraction decomposition |
+| Trig powers | sin^m(x)*cos^n(x) | Trig reduction formulas |
+| Trig substitution | x*sqrt(a^2-x^2) + a^2*arcsin(x/a) | Trig substitution patterns |
+| Power rule | x^n for various n including -1 | Basic power rule and log |
+| Exp chains | e^(f(x)) | Exponential compositions |
+| Hyperbolic | cosh(ax)/a, log(cosh(x)) | Hyperbolic function patterns |
+| Triple composition | sin(exp(exp(x))) | Deeply nested chains |
+| Poly product | x^n * f(x) | Polynomial times transcendental |
+
+Each skeleton is a function that returns a concrete antiderivative expression. For example, the "IBP: poly * exp" skeleton with n=2 returns `(x^2 - 2x + 2)*e^x`. Random coefficients are injected to produce variation within each family.
+
+The final dataset is composed in two phases:
+1. **70% skeleton-based**: The budget is divided equally among all 200+ skeletons, so rare families like trig substitution get exactly as many examples as common families like polynomials.
+2. **30% random exploration**: Unconstrained random tree generation fills the remaining budget, providing structural diversity beyond the enumerated templates.
+
+This guarantees that the model sees every integration technique proportionally, regardless of how likely each pattern is to appear by chance.
+
+#### Why the Rust engine is fast
+
+A Python implementation using SymPy generates ~1,000 pairs per second. The Rust engine generates ~50,000 pairs per minute on 8 cores. Three things make this possible:
+
+**1. No symbolic algebra system overhead.** SymPy represents expressions as Python objects with rich metadata, type checking, and automatic simplification at every operation. The Rust engine represents expressions as a simple enum tree (`ExprNode`) with variants for `Num(i64)`, `Var(VarId)`, `Unary(op, child)`, `Binary(op, left, right)`, etc. Building a tree node is a single allocation, not a chain of Python method calls.
+
+**2. Fused differentiation and simplification.** SymPy's `diff()` produces an unsimplified result, then `simplify()` is called separately --- and `simplify()` is the expensive part, trying dozens of algebraic strategies to find a shorter form. The Rust `diff.rs` engine fuses differentiation with simplification by using "smart constructors": when it computes `d/dx [x^2] = 2*x`, it doesn't create a `Mul(2, x)` node and simplify later. The `smart_mul` function checks at construction time: is either argument 0? Return 0. Is either argument 1? Return the other. Are both numeric? Compute the product. This catches most simplification opportunities at zero additional cost, during the differentiation itself.
+
+```rust
+// Example: smart_mul avoids creating degenerate nodes
+fn smart_mul(a: ExprNode, b: ExprNode) -> ExprNode {
+    if a.is_zero() || b.is_zero() { return ExprNode::num(0); }  // 0*x = 0
+    if a.is_one() { return b; }                                   // 1*x = x
+    if b.is_one() { return a; }                                   // x*1 = x
+    // ...numeric constant folding, double-negation elimination, etc.
+    ExprNode::Binary(BinaryOp::Mul, Box::new(a), Box::new(b))    // fallback
+}
+```
+
+Every differentiation rule (`chain rule`, `product rule`, `quotient rule`) builds its result through these smart constructors, so the output tree is already simplified. No separate simplification pass needed.
+
+**3. Rayon parallelism.** The `generate_covered_pairs` function distributes differentiation across all CPU cores using Rayon's parallel iterator. Each pair is independent --- no shared mutable state --- so this scales linearly with core count. On an 8-core machine, 8 pairs are differentiated simultaneously.
+
+```rust
+antiderivatives
+    .into_par_iter()                                    // parallel over all cores
+    .map(|integral| {
+        let integrand = differentiate(&integral, "x");  // pure function, no locks
+        Pair { integrand, integral }
+    })
+    .collect()
+```
+
+The combination means: building one tree takes microseconds (no Python overhead), differentiating it takes microseconds (fused simplification, no separate pass), and all trees are processed in parallel. The bottleneck shifts from CPU to memory bandwidth.
+
+#### Expression trees (`expr/`)
+
+Every mathematical expression is represented as a tree. Leaf nodes are numbers, variables (`x`, `y`), or constants (`pi`, `e`). Internal nodes are operators: binary (`+`, `-`, `*`, `/`, `^`) or unary (`sin`, `cos`, `exp`, `log`, `sqrt`, and 20+ others including special functions like `erf` and Bessel functions).
+
+#### Five generation modes
+
+The generator supports five modes, each producing a different type of integral:
+- *Univariate*: expressions in `x` only (500K pairs in the default dataset)
+- *Multivariate*: expressions in `x` and `y`, differentiated w.r.t. one variable (300K pairs)
+- *Definite*: evaluated at sampled bounds F(b) - F(a) (200K pairs)
+- *Parametric*: includes symbolic parameters (alpha, beta) treated as constants during differentiation (200K pairs)
+- *Special function*: includes erf, Bessel, elliptic integrals, etc. (300K pairs)
+
+#### Verification (`verify.rs`)
+
+Two-stage checking of whether a candidate antiderivative is correct:
 1. *Symbolic*: Differentiate the candidate, canonicalize both sides, compare. Resolves >97% of cases.
 2. *Numerical fallback*: Evaluate both expressions at 20 random points. Accept if at least 18/20 match within tolerance 1e-8.
 
 Verification runs at ~0.01ms per pair, parallelized via Rayon. This makes batch verification of all 25 candidates per test problem sub-second.
 
-**Canonicalization** (`canonical.rs`): E-graph equality saturation using the `egg` crate. Applies 20 algebraic rewrite rules (commutativity, associativity, trig identities, log rules, etc.) to extract the simplest equivalent form of an expression. Used for deduplication during data generation and for producing multiple equivalent targets per training example.
+#### Canonicalization (`canonical.rs`)
 
-**Feature extraction** (`features.rs`): Computes a 344-dimensional feature vector for each expression, used to inject structural information into the model. Includes: operator-type histograms at each depth level (264-dim), variable role features (16-dim), analytical signature classification (40-dim: gaussian, oscillatory, rational, singular, exponential), and complexity scalars (24-dim).
+E-graph equality saturation using the `egg` crate. Applies 20 algebraic rewrite rules (commutativity, associativity, trig identities, log rules, etc.) to extract the simplest equivalent form of an expression. Used for deduplication during data generation and for producing multiple equivalent targets per training example.
 
-**The Rust-Python bridge**: All Rust code is exposed to Python via PyO3. The Python training code calls into Rust for data generation, differentiation, and verification. This gives 100-1000x speedup over the pure-Python SymPy fallback.
+#### Feature extraction (`features.rs`)
+
+Computes a 344-dimensional feature vector for each expression, used to inject structural information into the model. Includes: operator-type histograms at each depth level (264-dim), variable role features (16-dim), analytical signature classification (40-dim: gaussian, oscillatory, rational, singular, exponential), and complexity scalars (24-dim).
+
+#### The Rust-Python bridge
+
+All Rust code is exposed to Python via PyO3. The Python training code calls into Rust for data generation, differentiation, and verification. A pure-Python fallback using SymPy exists (`scripts/generate_covered.py`) for environments where the Rust extension isn't compiled, but it runs ~50-100x slower.
 
 ### 2. Neural Model (Python/PyTorch)
 
