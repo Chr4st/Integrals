@@ -1,4 +1,5 @@
 pub mod actions;
+#[cfg(feature = "egraph")]
 pub mod canonical;
 pub mod compare;
 pub mod diff;
@@ -18,7 +19,7 @@ mod python {
     use crate::expr::PyExprTree;
 
     #[pymodule]
-    pub fn neurips_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    pub fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyExprTree>()?;
         m.add_class::<crate::gen::PyGenConfig>()?;
         m.add_class::<crate::env::PyEnv>()?;
