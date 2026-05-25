@@ -4,15 +4,19 @@ Generates training trajectories by sampling action chains of length
 L ∈ {1, 2, 3}, applying them through the Rust env to build
 (integrand, action_chain → F) pairs. Difficulty auto-escalates
 when the policy saturates short chains.
+
+Supports both REINFORCE (default) and MCTS-guided self-play.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import torch
+
+from neurips.inference.mcts import MCTSConfig, MCTSResult, mcts_search
 
 
 @dataclass(frozen=True)
@@ -196,6 +200,80 @@ def _run_episode(
         chain_length=len(action_ids),
         step_features=step_features,
     )
+
+
+@dataclass
+class MCTSSelfPlayConfig:
+    """Configuration for MCTS-guided self-play data generation."""
+
+    episodes_per_batch: int = 64
+    mcts: MCTSConfig = field(default_factory=MCTSConfig)
+
+
+def generate_mcts_trajectories(
+    policy_fn: Callable[[str], torch.Tensor],
+    value_fn: Callable[[str], float],
+    env_step_fn: Callable[[str, int], tuple[str, bool, bool]],
+    integrands: list[str],
+    config: MCTSSelfPlayConfig = MCTSSelfPlayConfig(),
+) -> list[tuple[str, list[float], float]]:
+    """Generate MCTS policy targets for training.
+
+    Returns list of (integrand, policy_target, root_value) tuples.
+    """
+    results: list[tuple[str, list[float], float]] = []
+
+    for _ in range(config.episodes_per_batch):
+        integrand = random.choice(integrands)
+        mcts_result = mcts_search(
+            root_state=integrand,
+            policy_fn=policy_fn,
+            value_fn=value_fn,
+            env_step_fn=env_step_fn,
+            config=config.mcts,
+        )
+        results.append((integrand, mcts_result.policy_target, mcts_result.root_value))
+
+    return results
+
+
+def compute_mcts_policy_loss(
+    policy: Any,
+    mcts_targets: list[tuple[str, list[float], float]],
+    feature_fn: Callable[[str], torch.Tensor],
+    device: str = "cpu",
+    value_head: Any = None,
+) -> torch.Tensor:
+    """Cross-entropy loss between policy output and MCTS visit distribution.
+
+    Also trains value head if provided.
+    """
+    if not mcts_targets:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    all_features = []
+    all_targets = []
+    all_values = []
+
+    for integrand, policy_target, root_value in mcts_targets:
+        feat = feature_fn(integrand)
+        all_features.append(feat)
+        all_targets.append(torch.tensor(policy_target, device=device))
+        all_values.append(root_value)
+
+    features = torch.stack(all_features).to(device)
+    targets = torch.stack(all_targets)
+    logits = policy(features)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    policy_loss = -(targets * log_probs).sum(dim=-1).mean()
+
+    if value_head is not None:
+        values_pred = value_head(features).squeeze(-1)
+        values_target = torch.tensor(all_values, device=device, dtype=torch.float32)
+        value_loss = torch.nn.functional.mse_loss(values_pred, values_target)
+        return policy_loss + value_loss
+
+    return policy_loss
 
 
 def compute_policy_loss(

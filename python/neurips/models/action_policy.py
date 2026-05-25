@@ -119,6 +119,31 @@ class SubstitutionParamHead(nn.Module):
         return scores
 
 
+class ValueHead(nn.Module):
+    """Value network for MCTS — estimates probability of solving from current state."""
+
+    def __init__(self, embed_dim: int = 256, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh(),
+        )
+
+    def forward(self, pooled_embedding: torch.Tensor) -> torch.Tensor:
+        """Estimate state value in [-1, 1].
+
+        Args:
+            pooled_embedding: (B, embed_dim) from tree GNN encoder.
+        Returns:
+            Value estimates (B, 1).
+        """
+        return self.mlp(pooled_embedding)
+
+
 class IBPParamHead(nn.Module):
     """Predicts (u, dv) split for integration-by-parts actions.
 
