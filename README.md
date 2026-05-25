@@ -95,7 +95,7 @@ The final dataset is composed in two phases:
 
 The split is deliberately aggressive toward skeletons. Random generation suffers from the same exponential bias that motivated skeleton enumeration in the first place: most randomly generated trees are simple polynomials or shallow compositions, so a larger random fraction just dilutes the hard examples. The 10% random budget exists only to catch structural patterns we may have missed in the skeleton catalog, not to provide bulk training data.
 
-#### Why the Rust engine is fast
+#### Why use Rust 
 
 A Python implementation using SymPy generates ~1,000 pairs per second. The Rust engine generates ~50,000 pairs per minute on 8 cores --- roughly 100x faster. This isn't just "Rust is faster than Python." The speedup comes from specific properties of how Rust compiles to machine code and how that machine code interacts with the CPU.
 
