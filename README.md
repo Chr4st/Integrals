@@ -6,7 +6,7 @@ The core idea: mathematical expressions are trees, not strings. Instead of flatt
 
 ## What the System Does
 
-**Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~50,000 pairs/minute.
+**Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~100,000 pairs/second on 8 cores.
 
 **Learning**: The model sees 1.5 million of these pairs across five types of integrals: univariate, multivariate, definite, parametric, and special-function. It learns patterns --- u-substitution looks like f(g(x))*g'(x), integration by parts has a polynomial times a transcendental, and so on.
 
@@ -97,7 +97,7 @@ The split is deliberately aggressive toward skeletons. Random generation suffers
 
 #### Why use Rust 
 
-A Python implementation using SymPy generates ~1,000 pairs per second. The Rust engine generates ~50,000 pairs per minute on 8 cores --- roughly 100x faster. This isn't just "Rust is faster than Python." The speedup comes from specific properties of how Rust compiles to machine code and how that machine code interacts with the CPU.
+A Python implementation using SymPy generates ~1,000 pairs per second. The Rust engine generates ~100,000 pairs per second on 8 cores --- roughly 100x faster. This isn't just "Rust is faster than Python." The speedup comes from specific properties of how Rust compiles to machine code and how that machine code interacts with the CPU.
 
 **1. Memory layout and cache behavior.**
 
