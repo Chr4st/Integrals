@@ -423,7 +423,7 @@ def _random_antiderivative() -> tuple[sp.Expr, sp.Expr] | None:
 def _try_rust_generate(total: int, output_dir: Path) -> dict | None:
     """Try Rust FFI path — returns report dict or None if unavailable."""
     try:
-        from neurips_core import GenConfig, generate_covered_batch
+        from neurips._core import GenConfig, py_generate_covered_batch as generate_covered_batch
     except ImportError:
         return None
 

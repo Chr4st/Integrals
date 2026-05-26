@@ -11,11 +11,11 @@ from pathlib import Path
 
 # Default counts per mode
 _DEFAULT_COUNTS: dict[str, int] = {
-    "univariate": 4_500_000,
-    "multivariate": 3_000_000,
-    "parametric": 2_250_000,
-    "definite": 2_250_000,
-    "special_fn": 3_000_000,
+    "univariate": 40_000_000,
+    "multivariate": 40_000_000,
+    "parametric": 40_000_000,
+    "definite": 40_000_000,
+    "special_fn": 40_000_000,
 }
 
 _CHUNK_SIZE: int = 1_000_000
