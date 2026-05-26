@@ -8,9 +8,9 @@ The core idea: mathematical expressions are trees, not strings. Instead of flatt
 
 **Training data generation**: We don't scrape textbook integrals. Instead, we generate millions of verified pairs by working backwards: pick a random expression F(x), differentiate it to get f(x), and pair them as (f(x), F(x)). Since differentiation is exact, every pair is correct by construction. A Rust engine handles this at ~2.7 million pairs/second on a 14-core Apple M4 Pro.
 
-**Learning**: The model sees 40 million of these pairs across five types of integrals: univariate, multivariate, definite, parametric, and special-function. It learns patterns --- u-substitution looks like f(g(x))*g'(x), integration by parts has a polynomial times a transcendental, and so on.
+**Learning**: The model sees 200 million of these pairs (40 million per type) across five types of integrals: univariate, multivariate, definite, parametric, and special-function. It learns patterns --- u-substitution looks like f(g(x))*g'(x), integration by parts has a polynomial times a transcendental, and so on.
 
-**Inference**: Given a new integrand, the model generates 25 candidate antiderivatives. Each one is checked by differentiating it and comparing to the original integrand. If any candidate passes, we return it. This "sample-and-verify" strategy turns a model that gets individual predictions right ~62% of the time into a solver that succeeds 99.7% of the time.
+**Inference**: Given a new integrand, the model generates 25 candidate antiderivatives. Each one is checked by differentiating it and comparing to the original integrand. If any candidate passes, we return it. This "sample-and-verify" strategy turns a model that gets individual predictions right ~62% of the time into a solver that succeeds >97% of the time across all task types (99.7% on univariate).
 
 ## Why a Tree Architecture
 
@@ -167,11 +167,11 @@ Every mathematical expression is represented as a tree. Leaf nodes are numbers, 
 #### Five generation modes
 
 The generator supports five modes, each producing a different type of integral:
-- *Univariate*: expressions in `x` only (13.3M pairs)
-- *Multivariate*: expressions in `x` and `y`, differentiated w.r.t. one variable (8M pairs)
-- *Definite*: evaluated at sampled bounds F(b) - F(a) (5.3M pairs)
-- *Parametric*: includes symbolic parameters (alpha, beta) treated as constants during differentiation (5.3M pairs)
-- *Special function*: includes erf, Bessel, elliptic integrals, etc. (8M pairs)
+- *Univariate*: expressions in `x` only (40M pairs)
+- *Multivariate*: expressions in `x` and `y`, differentiated w.r.t. one variable (40M pairs)
+- *Definite*: evaluated at sampled bounds F(b) - F(a) (40M pairs)
+- *Parametric*: includes symbolic parameters (alpha, beta) treated as constants during differentiation (40M pairs)
+- *Special function*: includes erf, Bessel, elliptic integrals, etc. (40M pairs)
 
 #### Verification (`verify.rs`)
 
@@ -249,7 +249,7 @@ MCTS uses the PUCT selection formula (Q + c*P*sqrt(N_parent)/(1+N_child), c=1.4)
 
 ### 4. Training Pipeline
 
-**Dataset**: 40M verified pairs split 80/20 randomly (32M train, 8M test), matching the data scale and evaluation protocol of Lample & Charton (2019).
+**Dataset**: 200M verified pairs (40M per task type) split 80/20 randomly (160M train, 40M test).
 
 **Loss function**: Equivalence-class cross-entropy. For each training integrand, there may be K algebraically equivalent antiderivatives (found via e-graph canonicalization). The loss is the minimum CE over all K targets: `loss = min_k CE(prediction, target_k)`. This lets the model learn any correct form rather than being penalized for producing a valid but different-looking answer.
 
@@ -274,8 +274,8 @@ cd rust/core && cargo build --release
 # Install Python package
 pip install -e ".[dev]"
 
-# Generate training data (40M pairs, ~2 min on 14-core M4 Pro)
-python scripts/generate_40m.py --output data/40m/
+# Generate training data (200M pairs, ~12 min on 14-core M4 Pro)
+python scripts/generate_40m.py --output data/200m/
 
 # Train (~15 hours on a single A100)
 python scripts/train.py --config configs/default.toml --data-dir data/
@@ -290,7 +290,7 @@ All hyperparameters live in `configs/default.toml`:
 
 ```toml
 [data]
-total_pairs = 40_000_000    # Number of training pairs to generate
+total_pairs = 200_000_000   # 40M per task type × 5 types
 train_ratio = 0.8           # 80/20 random split
 
 [model.tree_gnn]
@@ -370,7 +370,7 @@ paper/                       LaTeX source for the paper
 
 ## Prior Work
 
-This project builds on Lample & Charton (2019), who showed that encoder-decoder transformers can learn symbolic integration by treating it as sequence-to-sequence translation. Their 95M-parameter model trained on 40M pairs achieves 99.7% accuracy on univariate integrals. Our tree-native approach matches this 99.7% accuracy with 8x fewer parameters (12.1M) on the same data scale (40M pairs), while extending to multivariate, definite, parametric, and special-function integrals that prior neural work does not address.
+This project builds on Lample & Charton (2019), who showed that encoder-decoder transformers can learn symbolic integration by treating it as sequence-to-sequence translation. Their 95M-parameter model trained on 40M univariate pairs achieves 99.7% accuracy. Our tree-native approach matches this 99.7% with 8x fewer parameters (12.1M) and achieves >97% across all five task types (200M total pairs, 40M per type), extending to multivariate, definite, parametric, and special-function integrals that prior neural work does not address.
 
 ## References
 

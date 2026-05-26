@@ -1,5 +1,5 @@
 [data]
-total_pairs = 40_000_000
+total_pairs = 200_000_000
 train_ratio = 0.8
 seed = 42
 

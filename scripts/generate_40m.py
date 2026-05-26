@@ -15,11 +15,11 @@ from pathlib import Path
 CHUNK_SIZE = 500_000
 
 TASK_COUNTS = {
-    "univariate": 13_333_333,
-    "multivariate": 8_000_000,
-    "definite": 5_333_333,
-    "parametric": 5_333_334,
-    "special": 8_000_000,
+    "univariate": 40_000_000,
+    "multivariate": 40_000_000,
+    "definite": 40_000_000,
+    "parametric": 40_000_000,
+    "special": 40_000_000,
 }
 
 TOTAL = sum(TASK_COUNTS.values())
