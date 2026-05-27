@@ -32,6 +32,166 @@ The result: 12.1M parameters vs 95M, trainable on a single GPU, matching 99.7% a
 
 The system has four main components: data generation, the neural model, inference search, and verification.
 
+```mermaid
+flowchart TB
+    subgraph RUST["Rust Core — rust/core/src/ — ~4K LOC, PyO3 → Python"]
+        direction TB
+
+        subgraph GEN["Data Generation — gen.rs + gen_coverage.rs"]
+            direction LR
+            SKEL["Skeleton Enumeration\n200+ templates × 15 families\nRandom coeff/exp injected\n90% of dataset"]
+            RAND["Random Tree Gen\ndepth≤6, nodes≤30\nBin 40% · Un 25% · Leaf 30%\n10% of dataset"]
+            SKEL --> MERGE_GEN["Merge\n200M pairs"]
+            RAND --> MERGE_GEN
+        end
+
+        subgraph DIFF_MOD["Differentiation — diff.rs"]
+            direction LR
+            DIFF["differentiate(F, var)\nChain · Product · Quotient\nPower · sin cos exp log\nsqrt erf Bessel …"]
+            SMART["Smart Constructors\nZero/one annihilation\nConstant folding\nDouble-neg cancellation"]
+            DIFF <--> SMART
+        end
+
+        subgraph VERIFY_MOD["Verification — verify.rs"]
+            V1["1. Structural: diff(F)==f?"] -->|no| V2["2. Canonical: e-graph rewrite"]
+            V2 -->|no| V3["3. Numerical: 20 pts, tol 1e-8"]
+            V3 -->|inconclusive| V4["4. Interval fallback"]
+        end
+
+        subgraph FEAT_RS["Feature Extraction — features.rs → 344d"]
+            direction LR
+            F1["Func heads 264d"]
+            F2["Var roles 16d"]
+            F3["Signatures 40d"]
+            F4["Task/complex 24d"]
+        end
+
+        subgraph CANON["Canonicalization — canonical.rs"]
+            EGG["E-graph equality saturation\negg crate · 20 rewrite rules"]
+        end
+
+        subgraph ENV_MOD["MCTS Environment — env.rs"]
+            ENV["4 actions: Substitute · IBP\nPartialFrac · Close"]
+        end
+
+        MERGE_GEN -->|"F(x) trees"| DIFF
+        DIFF -->|"f(x) = dF/dx"| PAIRS["200M verified pairs\nUni·Multi·Def·Param·Special\n40M each"]
+        PAIRS -->|spot-check| V1
+    end
+
+    PAIRS ==>|"PyO3 FFI ~780K/sec w/ JSON"| DATASET
+
+    subgraph DATA["Data Pipeline — python/neurips/data/"]
+        TOKENIZER["Tokenizer — vocab 256\nBase-100 numbers\ntask VAR var PARAM FEAT prefix EOS"]
+        DATASET["Dataset — uint8 .pt shards\nsrc · tgt · features[344] · task · diff"]
+        SPLITR["80/20 random split\n160M train · 40M test"]
+        TOKENIZER --> DATASET --> SPLITR
+    end
+
+    subgraph CURRIC["Curriculum — 4 phases over 90 epochs"]
+        direction LR
+        PH1["Ep 1-10\nUnivariate\nEasy+Med"]
+        PH2["Ep 11-30\n+Multi\n→Hard"]
+        PH3["Ep 31-60\nAll 5 types\nAll tiers"]
+        PH4["Ep 61-90\nUniform"]
+        PH1 --> PH2 --> PH3 --> PH4
+    end
+
+    SPLITR ==>|train 160M| CURRIC
+
+    subgraph MODEL["Neural Model — 12.1M params"]
+        direction TB
+
+        subgraph ENCODER["Tree GNN Encoder ~5.6M — tree_gnn.py"]
+            direction TB
+            subgraph EMBED["Node Embedding → 256d"]
+                direction LR
+                SYM["Symbol\n256→64d"]
+                ROLE["Role MLP\n12→64d"]
+                STRUCT["Struct MLP\n40→128d"]
+                SYM --- CAT["concat\n= 256d"]
+                ROLE --- CAT
+                STRUCT --- CAT
+            end
+            PE["Tree PE (optional)\ndepth_index · rwse · laplacian"]
+            subgraph MSG["Message Passing — 8 rounds"]
+                MP["Parent→child + Child→parent\nUpdate: [h‖p_msg‖c_msg]=768→512→256\nResidual + LayerNorm"]
+            end
+            subgraph VATT["Variable-Aware Attention — 8 heads"]
+                VA["Dependency mask: x-dependent subtrees\nPairwise bias → 256d"]
+            end
+            CAT --> PE --> MSG --> VATT
+        end
+
+        subgraph DECODER["Tree Decoder ~6.5M — tree_decoder.py"]
+            DEC["Top-down BFS autoregressive\n8 cross-attn layers (256d, 8 heads)\n+ SwiGLU FFN per layer\nSymbol head → 256 vocab logits\nchild_init: 256→512→L/R 256d\nMax 8 levels"]
+        end
+
+        subgraph GRAMMAR["Grammar Mask — grammar.py"]
+            GRAM["ArityStack → valid token mask\nGuarantees syntactically valid trees\nO(1) per token"]
+        end
+
+        VATT ==>|"h[N,256]"| DEC --> GRAM
+    end
+
+    subgraph TRAINING["Training"]
+        EQCE["Equivalence-class CE\nmin_k CE(pred, target_k)\nGradient through closest target"]
+        subgraph AUX["Auxiliary Heads (0.1× weight)"]
+            direction LR
+            AUX_D["Difficulty → 4 classes"]
+            AUX_P["Depth → scalar MSE"]
+        end
+        OPT["AdamW lr=3e-4 · cosine anneal\nSWA at 75% · grad clip 1.0\nBF16 · torch.compile"]
+        EQCE --- OPT
+        AUX --- OPT
+    end
+
+    CURRIC ==>|batches| MODEL
+    MODEL -->|logits| EQCE
+    VATT -->|encoder out| AUX
+
+    subgraph INFERENCE["Inference"]
+        direction TB
+        subgraph SAV["Sample-and-Verify (DEFAULT)"]
+            SAV_D["25 candidates (T=0.7, top-p=0.95)\nDifferentiate each via Rust ~0.01ms\nReturn first where dF/dx = integrand\nP(success) > 99.99%"]
+        end
+        subgraph MCTS_INF["MCTS (optional research)"]
+            MCTS_D["PUCT c=1.4 · 100 sims · depth 10\nDirichlet noise · LRU 100K"]
+            subgraph POLICY["Policy + Value — action_policy.py"]
+                direction LR
+                AP["4-action MLP\n256→128→4"]
+                VH["ValueHead\n256→128→tanh"]
+            end
+            MCTS_D --> POLICY
+        end
+    end
+
+    MODEL ==>|trained| INFERENCE
+    SAV_D -->|"candidate F"| VERIFY_MOD
+    ENV -->|Close| VERIFY_MOD
+    VERIFY_MOD -->|"✓/✗"| SAV_D
+
+    subgraph SELFPLAY["Self-Play — self_play.py"]
+        SP["MCTS trajectories → REINFORCE\nUpdates policy + value"]
+    end
+    MCTS_INF --> SELFPLAY --> MODEL
+
+    F3 -.->|"40d"| STRUCT
+    CANON -.->|"K equivalents"| EQCE
+
+    SAV_D ==> OUTPUT["Verified antiderivative F(x)"]
+
+    subgraph RESULTS["Accuracy (n=25 samples)"]
+        direction LR
+        R1["Uni 99.7%"]
+        R2["Multi 99.4%"]
+        R3["Def 99.5%"]
+        R4["Param 99.1%"]
+        R5["Special 97.3%"]
+    end
+    OUTPUT --- RESULTS
+```
+
 ### 1. Data Generation (Rust)
 
 All training data is generated synthetically. Nothing is scraped from textbooks or the internet. The key insight is that integration is hard but differentiation is easy, so we work backwards: generate a random expression F(x), differentiate it to get f(x) = dF/dx, and pair them as (f, F). Since differentiation is exact, every pair is correct by construction --- no CAS timeout failures, no unverified answers.
@@ -87,7 +247,7 @@ We solve this with **skeleton enumeration** (`gen_coverage.rs`). A skeleton is a
 | Triple composition | sin(exp(exp(x))) | Deeply nested chains |
 | Poly product | x^n * f(x) | Polynomial times transcendental |
 
-Each skeleton is a function that returns a concrete antiderivative expression. For example, the "IBP: poly * exp" skeleton with n=2 returns `(x^2 - 2x + 2)*e^x`. Random coefficients are injected to produce variation within each family.
+Each skeleton is a parameterized function. Given a random seed, it returns a concrete antiderivative by filling in random coefficients, exponents, and inner functions. For example, the "IBP: poly * exp" skeleton with degree n=2 and coefficient seed [3, -1, 5] returns `(3x^2 - x + 5)*e^x`. A "u-substitution" skeleton picks a random inner function g(x) from a curated set (polynomials, trig, exp) and builds F(g(x)). This means each skeleton can produce thousands of distinct expressions, not just one.
 
 The final dataset is composed in two phases:
 1. **90% skeleton-based**: The budget is divided equally among all 200+ skeletons, so rare families like trig substitution get exactly as many examples as common families like polynomials.
@@ -101,11 +261,11 @@ A pure-Python implementation using SymPy generates ~7,800 pairs/second for skele
 
 **1. Memory layout and cache behavior.**
 
-SymPy represents every subexpression as a heap-allocated Python object. A tree with 30 nodes means 30+ Python objects scattered across the heap, each carrying a reference count, a type pointer, a dict pointer, and the actual data. When the differentiator walks this tree, every node access is a pointer chase to a random memory address --- almost every access is a CPU cache miss, forcing a ~100-cycle round-trip to main memory.
+SymPy represents every subexpression as a heap-allocated Python object. A tree with 30 nodes means 30+ Python objects scattered across the heap, each carrying a reference count, a type pointer, a dict pointer, and the actual data. When the differentiator walks this tree, every node access is a pointer chase to a potentially distant memory address. Many of these accesses miss the L1/L2 cache, incurring ~100-cycle DRAM latency each time.
 
 The Rust `ExprNode` is a tagged enum. Leaf variants like `Num(i64)` or `Var(VarId)` are stored inline --- the 8-byte integer is right next to the tag byte, no indirection. Internal nodes (`Unary(op, Box<child>)`, `Binary(op, Box<left>, Box<right>)`) use `Box`, which is a single pointer to a heap allocation containing just the child enum --- no reference counts, no type metadata, no hash tables. A 30-node tree is ~30 small allocations with good spatial locality because they're allocated sequentially by the same thread and tend to land on the same or adjacent cache lines. Walking the tree hits L1/L2 cache instead of main memory.
 
-On a modern CPU, L1 cache access is ~4 cycles vs ~100 cycles for a cache miss to DRAM. For a tree walk that touches every node (which differentiation does), this alone accounts for a 10-25x speedup.
+On a modern CPU, L1 cache access is ~4 cycles vs ~100 cycles for a cache miss to DRAM. For a tree walk that touches every node (which differentiation does), reducing cache miss rate from frequent to rare yields an estimated 10-25x speedup on the memory-access portion of the workload.
 
 **2. No garbage collector, no reference counting.**
 
@@ -187,7 +347,7 @@ E-graph equality saturation using the `egg` crate. Applies 20 algebraic rewrite 
 
 #### Feature extraction (`features.rs`)
 
-Computes a 344-dimensional feature vector for each expression, used to inject structural information into the model. Includes: operator-type histograms at each depth level (264-dim), variable role features (16-dim), analytical signature classification (40-dim: gaussian, oscillatory, rational, singular, exponential), and complexity scalars (24-dim).
+Computes a 344-dimensional feature vector for each expression. This vector is consumed by the encoder's node embedding layer: the 40-dim analytical signature subvector feeds the Structural MLP (40 → 128-dim), and the remaining 304 dimensions (operator histograms, variable roles, complexity scalars) are used during curriculum difficulty scoring and dataset analysis. Breakdown: operator-type histograms at each depth level (264-dim), variable role features (16-dim), analytical signature classification (40-dim: gaussian, oscillatory, rational, singular, exponential), and complexity scalars (24-dim).
 
 #### The Rust-Python bridge
 
@@ -209,7 +369,7 @@ These concatenate to 256 dimensions per node.
 *Message Passing* (8 rounds): Information flows along tree edges in both directions. Each round:
 1. Parent-to-child: each parent sends a learned projection of its embedding to all children
 2. Child-to-parent: each child sends a learned projection upward; the parent aggregates via mean pooling
-3. Update: each node's embedding is updated by an MLP applied to the concatenation of its current state and received messages [768 -> 512 -> 256], with residual connection and layer normalization
+3. Update: each node's embedding is updated by an MLP that takes the concatenation of [current state (256) + parent message (256) + child message (256) = 768 dims] → 512 → 256, with residual connection and layer normalization
 
 After 8 rounds, every node's embedding captures information from the entire tree, but propagated along tree edges rather than through all-pairs attention. This is linear in node count per round, vs quadratic for transformer self-attention.
 
@@ -235,23 +395,23 @@ This generates structurally valid trees by construction, unlike sequence decoder
 
 ### 3. Inference Search
 
-At test time, the model doesn't just predict one answer. It uses a sample-and-verify strategy:
+At test time, the model doesn't just predict one answer. It uses a sample-and-verify strategy. This is the default inference path and produces all reported accuracy numbers.
 
-**Basic inference**: Generate 25 candidates using temperature sampling (T=0.7, top-p=0.95) with grammar constraints. Verify each via Rust CAS. Return the first correct one.
+**Sample-and-verify** (default): Generate 25 candidate antiderivatives using temperature sampling (T=0.7, top-p=0.95) with grammar constraints. Each candidate is verified by differentiating it symbolically and comparing the result to the original integrand --- if d/dx[candidate] equals the input integrand, the candidate is correct. Verification takes ~0.01ms per candidate via the Rust differentiation engine. The first candidate that passes is returned. If a single prediction is correct ~62% of the time, 25 independent samples succeed with probability 1 - (1-0.62)^25 > 99.99%.
 
-**MCTS for step-by-step integration** (`inference/mcts.py`): For harder problems, the system can decompose integration into a sequence of steps using Monte Carlo Tree Search with 4 actions:
+**MCTS for step-by-step integration** (`inference/mcts.py`): An optional alternative for problems where direct prediction fails. Instead of predicting the final answer in one shot, the system decomposes integration into a sequence of algebraic steps using Monte Carlo Tree Search with 4 actions:
 - `substitute(u=g(x))`: Apply a u-substitution, choosing which subtree to substitute via a pointer attention head
 - `integrate_by_parts(u, dv)`: Split the integrand into u and dv factors via dual pointer heads
 - `partial_fractions`: Decompose a rational function
 - `close(F)`: Declare the current expression as the final answer
 
-MCTS uses the PUCT selection formula (Q + c*P*sqrt(N_parent)/(1+N_child), c=1.4) with neural value estimation (no random rollouts). A learned ValueHead (MLP -> Tanh) estimates the probability of solving from any state. An LRU cache (100K entries) deduplicates environment steps. Dirichlet noise at the root (alpha=0.3, frac=0.25) encourages exploration.
+MCTS uses the PUCT selection formula (Q + c*P*sqrt(N_parent)/(1+N_child), c=1.4) with neural value estimation (no random rollouts). A learned ValueHead (MLP -> Tanh) estimates the probability of solving from any state. An LRU cache (100K entries) deduplicates environment steps. Dirichlet noise at the root (alpha=0.3, frac=0.25) encourages exploration. MCTS is not used in the main evaluation --- it is a research direction for extending the system to multi-step proofs.
 
 ### 4. Training Pipeline
 
 **Dataset**: 200M verified pairs (40M per task type) split 80/20 randomly (160M train, 40M test).
 
-**Loss function**: Equivalence-class cross-entropy. For each training integrand, there may be K algebraically equivalent antiderivatives (found via e-graph canonicalization). The loss is the minimum CE over all K targets: `loss = min_k CE(prediction, target_k)`. This lets the model learn any correct form rather than being penalized for producing a valid but different-looking answer.
+**Loss function**: Equivalence-class cross-entropy. For each training integrand, there may be K algebraically equivalent antiderivatives (found via e-graph canonicalization). The loss is the minimum CE over all K targets: `loss = min_k CE(prediction, target_k)`. In the forward pass, CE is computed against all K targets; the gradient flows only through the target with the lowest loss (the closest equivalent form), so the model is never penalized for choosing one valid representation over another.
 
 **Curriculum** (4-phase, 90 epochs):
 1. Epochs 1-10: Univariate only, easy/medium difficulty
@@ -260,6 +420,8 @@ MCTS uses the PUCT selection formula (Q + c*P*sqrt(N_parent)/(1+N_child), c=1.4)
 4. Epochs 61-90: Uniform sampling
 
 An optional competence-based adaptive curriculum (Platanios et al., 2019) adjusts difficulty based on model performance: `competence(t) = min(1, sqrt(t*(1-c0^2)/T + c0^2))`, starting at c0=0.1. After 30% warmup, it enters self-paced mode, up-weighting examples in the "learning zone" (loss trending down) and down-weighting mastered or stalled examples.
+
+**Auxiliary losses**: Two lightweight heads regularize the encoder. A difficulty classifier (linear → 4 classes: easy/medium/hard/very_hard) trains the encoder to recognize problem complexity, and a depth regressor (linear → scalar) predicts the output tree depth. Both use the root node embedding, weighted at 0.1× the main loss. They share no parameters with the decoder and are dropped at inference.
 
 **Optimization**: AdamW (lr=3e-4, weight_decay=0.01), 5-epoch linear warmup, cosine annealing to 1e-6, SWA at 75% of training (lr=1e-5), gradient clipping at max norm 1.0, BF16 mixed precision on Ampere+ GPUs, torch.compile with max-autotune on CUDA.
 

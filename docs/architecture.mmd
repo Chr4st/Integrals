@@ -1,0 +1,263 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#16213e', 'lineColor': '#0f3460', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'fontSize': '14px'}}}%%
+
+flowchart TB
+    %% ═══════════════════════════════════════════════════════════════
+    %% DATA GENERATION (Rust)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph RUST["<b>Rust Core</b> &nbsp; rust/core/src/ &nbsp; (~4K LOC, PyO3 → Python)"]
+        direction TB
+
+        subgraph GEN["<b>Data Generation</b> &nbsp; gen.rs + gen_coverage.rs"]
+            direction LR
+            SKEL["<b>Skeleton Enumeration</b><br/>200+ templates × 15 families<br/>Random coefficients/exponents<br/>injected per template<br/><i>90% of dataset</i>"]
+            RAND["<b>Random Tree Gen</b><br/>max_depth=6, max_nodes=30<br/>Binary 40% · Unary 25% · Leaf 30%<br/><i>10% of dataset</i>"]
+            SKEL --> MERGE_GEN["Merge<br/>200M total pairs"]
+            RAND --> MERGE_GEN
+        end
+
+        subgraph DIFF_MOD["<b>Differentiation</b> &nbsp; diff.rs"]
+            direction LR
+            DIFF["<b>differentiate(F, var)</b><br/>Chain · Product · Quotient · Power<br/>sin cos exp log sqrt erf Bessel …"]
+            SMART["<b>Smart Constructors</b><br/>smart_add · smart_mul · smart_div<br/>smart_pow · smart_neg<br/>Zero/one annihilation<br/>Constant folding<br/>Double-neg cancellation"]
+            DIFF <--> SMART
+        end
+
+        subgraph VERIFY_MOD["<b>Verification</b> &nbsp; verify.rs"]
+            direction TB
+            V1["<b>1. Structural</b><br/>diff(F) == f ?"]
+            V2["<b>2. Canonical</b><br/>E-graph rewrite rules<br/>sin²+cos²→1, exp∘log→id, a/a→1"]
+            V3["<b>3. Numerical</b><br/>20 random points<br/>tol = 1e-8, accept ≥18/20"]
+            V4["<b>4. Interval Fallback</b><br/>If <5 evaluable points"]
+            V1 -->|"no match"| V2 -->|"no match"| V3 -->|"inconclusive"| V4
+        end
+
+        subgraph FEAT_RS["<b>Feature Extraction</b> &nbsp; features.rs &nbsp; → 344-dim"]
+            direction LR
+            F1["Func heads<br/><b>264d</b><br/>33 types × 8 depth bins"]
+            F2["Var roles<br/><b>16d</b><br/>presence · density · depths"]
+            F3["Signatures<br/><b>40d</b><br/>gauss · osc · rat · sing · exp"]
+            F4["Task/complexity<br/><b>24d</b><br/>one-hot · node count · depth"]
+        end
+
+        subgraph CANON["<b>Canonicalization</b> &nbsp; canonical.rs"]
+            EGG["E-graph equality saturation<br/>(egg crate, 20 rewrite rules)<br/><i>Optional: feature-gated</i>"]
+        end
+
+        subgraph ENV_MOD["<b>MCTS Environment</b> &nbsp; env.rs"]
+            direction LR
+            ENV["Env { integrand, state, var }<br/><b>4 actions:</b><br/>Substitute · IBP · PartialFrac · Close"]
+            REWARD["<b>Reward</b><br/>Correct close: +1.0 + simplicity bonus<br/>Incorrect: −1.0 · Timeout: −1.0"]
+            ENV --> REWARD
+        end
+
+        MERGE_GEN -->|"F(x) trees"| DIFF
+        DIFF -->|"f(x) = dF/dx"| PAIRS["<b>200M verified pairs</b><br/>(f, F) per type:<br/>Uni 40M · Multi 40M · Def 40M<br/>Param 40M · Special 40M"]
+        PAIRS -->|"spot-check"| V1
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% PyO3 BRIDGE
+    %% ═══════════════════════════════════════════════════════════════
+    PAIRS ==>|"PyO3 FFI<br/>~780K pairs/sec<br/>w/ JSON"| DATASET
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% DATA PIPELINE (Python)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph DATA["<b>Data Pipeline</b> &nbsp; python/neurips/data/"]
+        direction TB
+
+        subgraph TOK["<b>Tokenizer</b> &nbsp; tokenizer.py"]
+            TOKENIZER["IntegralTokenizer<br/>vocab_size = 256<br/>Base-100 number encoding<br/><b>Format:</b> [task] [VAR] var [PARAM …] [FEAT] [prefix …] [EOS]"]
+        end
+
+        subgraph DS["<b>Dataset</b> &nbsp; dataset.py"]
+            DATASET["IntegralDataset<br/>Pre-computed uint8 tensors → .pt shards<br/>8× RAM reduction vs float32<br/><b>Fields:</b> src_ids · tgt_ids · features[344] · task_id · diff_id"]
+        end
+
+        subgraph SPLIT_DS["<b>Split</b> &nbsp; split.py"]
+            SPLITR["80/20 random split<br/>160M train · 40M test"]
+        end
+
+        TOKENIZER --> DATASET --> SPLITR
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% CURRICULUM
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph CURRIC["<b>Curriculum</b> &nbsp; training/curriculum.py"]
+        direction LR
+        PH1["<b>Phase 1</b><br/>Ep 1-10<br/>Univariate<br/>Easy+Medium"]
+        PH2["<b>Phase 2</b><br/>Ep 11-30<br/>+Multivariate<br/>Up to Hard"]
+        PH3["<b>Phase 3</b><br/>Ep 31-60<br/>All 5 types<br/>All tiers"]
+        PH4["<b>Phase 4</b><br/>Ep 61-90<br/>Uniform<br/>sampling"]
+        PH1 --> PH2 --> PH3 --> PH4
+        COMP["<b>Adaptive (optional)</b><br/>CompetenceCurriculum<br/>c(t) = √(t(1−c₀²)/T + c₀²)<br/>Self-paced from 30% warmup"]
+    end
+
+    SPLITR -->|"train set<br/>160M pairs"| CURRIC
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% NEURAL MODEL
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph MODEL["<b>Neural Model</b> &nbsp; 12.1M params &nbsp; python/neurips/models/"]
+        direction TB
+
+        subgraph ENCODER["<b>Tree GNN Encoder</b> &nbsp; ~5.6M params &nbsp; tree_gnn.py"]
+            direction TB
+
+            subgraph EMBED["<b>Node Embedding</b> &nbsp; → 256d per node"]
+                direction LR
+                SYM["Symbol embed<br/>256 tokens → <b>64d</b>"]
+                ROLE["Role MLP<br/>12 feats → <b>64d</b><br/>root? leaf? L/R child?<br/>arity · depth parity"]
+                STRUCT["Structural MLP<br/>40 feats → <b>128d</b><br/>subtree size · depth<br/>sibling count · shape"]
+                SYM --- CAT_EMB["concat<br/><b>= 256d</b>"]
+                ROLE --- CAT_EMB
+                STRUCT --- CAT_EMB
+            end
+
+            PE["<b>Tree Positional Encoding</b> &nbsp; tree_positional.py<br/>depth_index: sinusoidal + learnable child pos<br/>rwse: k-step random walk landing probs<br/>laplacian: normalized graph Laplacian eigenvectors<br/><i>Additive, configurable, default = none</i>"]
+
+            subgraph MSG["<b>Message Passing</b> &nbsp; 8 rounds"]
+                direction TB
+                MP_DETAIL["Per round:<br/>1. Parent→child: learned projection<br/>2. Child→parent: projection + mean-pool aggregation<br/>3. Update MLP: [h(256) ‖ parent_msg(256) ‖ child_msg(256)]<br/>&nbsp;&nbsp;&nbsp;= 768 → 512 → <b>256d</b><br/>+ Residual + LayerNorm"]
+            end
+
+            subgraph VAR_ATT["<b>Variable-Aware Attention</b> &nbsp; 8 heads"]
+                VA_DETAIL["Bottom-up dependency mask:<br/>node is x-dependent if any descendant contains x<br/>Pairwise attention bias: same-dependency nodes<br/>attend more strongly to each other<br/>→ <b>256d</b> per node"]
+            end
+
+            CAT_EMB --> PE --> MSG --> VAR_ATT
+        end
+
+        subgraph DECODER["<b>Tree Decoder</b> &nbsp; ~6.5M params &nbsp; tree_decoder.py"]
+            direction TB
+            DEC_DETAIL["<b>Top-down BFS autoregressive generation</b><br/><br/>1. Root seed embedding from encoder (256d)<br/>2. Per level: frontier nodes query encoder via<br/>&nbsp;&nbsp;&nbsp;<b>8 cross-attention layers</b> (pre-norm, 256d, 8 heads)<br/>&nbsp;&nbsp;&nbsp;each + SwiGLU FFN (256 → 341 → 256)<br/>3. <b>Symbol head</b>: linear → vocab logits (256 classes)<br/>4. Non-leaf predictions spawn children via<br/>&nbsp;&nbsp;&nbsp;<b>child_init</b> (256 → 512 → split to L/R child 256d)<br/>5. Stop when all frontier = leaves or 8 levels reached"]
+        end
+
+        subgraph GRAMMAR["<b>Grammar Mask</b> &nbsp; grammar.py"]
+            GRAM_DETAIL["ArityStack tracks remaining child slots<br/>Enforces: complete → only EOS<br/>depth > 20 → only leaves<br/>else → all valid tokens<br/><b>O(1) per token</b> · guarantees valid trees"]
+        end
+
+        VAR_ATT ==>|"h[N, 256]<br/>node embeddings"| DEC_DETAIL
+        DEC_DETAIL --> GRAM_DETAIL
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% TRAINING
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph TRAINING["<b>Training Pipeline</b> &nbsp; training/"]
+        direction TB
+
+        subgraph LOSS_MOD["<b>Loss</b> &nbsp; loss.py"]
+            EQCE["<b>Equivalence-class CE</b><br/>loss = min_k CE(pred, target_k)<br/>K equivalent antiderivatives from e-graph<br/>Gradient flows only through closest target"]
+        end
+
+        subgraph AUX["<b>Auxiliary Heads</b> &nbsp; auxiliary.py &nbsp; (0.1× weight)"]
+            direction LR
+            AUX_DIFF["Difficulty classifier<br/>mean-pool encoder → linear → 4 classes<br/>easy/medium/hard/very_hard"]
+            AUX_DEPTH["Depth regressor<br/>mean-pool encoder → linear → scalar<br/>MSE loss"]
+        end
+
+        subgraph OPTIM["<b>Optimization</b>"]
+            OPT_DETAIL["AdamW (lr=3e-4, wd=0.01)<br/>5-epoch linear warmup → cosine anneal → 1e-6<br/>SWA at 75% (lr=1e-5)<br/>Grad clip max_norm=1.0<br/>BF16 mixed precision · torch.compile"]
+        end
+
+        EQCE --- OPTIM
+        AUX --- OPTIM
+    end
+
+    CURRIC ==>|"batches<br/>filtered by phase"| MODEL
+    MODEL -->|"logits[B,T,256]"| EQCE
+    VAR_ATT -->|"encoder output"| AUX
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% INFERENCE
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph INFERENCE["<b>Inference</b> &nbsp; inference/"]
+        direction TB
+
+        subgraph SAV["<b>Sample-and-Verify (DEFAULT)</b>"]
+            SAV_DETAIL["1. Encode input integrand → h[N, 256]<br/>2. Decode 25 candidates (T=0.7, top-p=0.95)<br/>&nbsp;&nbsp;&nbsp;with grammar constraints<br/>3. For each candidate F:<br/>&nbsp;&nbsp;&nbsp;differentiate F symbolically (Rust, ~0.01ms)<br/>&nbsp;&nbsp;&nbsp;compare d/dx[F] to input integrand<br/>4. Return first verified match<br/><br/>P(success) = 1 − (1−0.62)²⁵ > 99.99%"]
+        end
+
+        subgraph MCTS_INF["<b>MCTS (optional research)</b> &nbsp; mcts.py"]
+            direction TB
+            MCTS_DETAIL["<b>Step-by-step integration via tree search</b><br/><br/>PUCT: Q + c·P·√N_parent / (1+N_child), c=1.4<br/>Dirichlet noise at root (α=0.3, frac=0.25)<br/>100 simulations · max depth 10<br/>LRU cache 100K entries"]
+
+            subgraph POLICY["<b>Policy + Value Heads</b> &nbsp; action_policy.py"]
+                direction LR
+                ACT_POL["ActionPolicy<br/>256 → 128 → <b>4 logits</b><br/>substitute · IBP<br/>partial_frac · close"]
+                SUB_HEAD["SubstitutionParamHead<br/>Pointer attention<br/>→ node logits[N]<br/><i>which subtree to sub</i>"]
+                IBP_HEAD["IBPParamHead<br/>Dual pointer attention<br/>→ (u_logits, dv_logits)<br/><i>parts split</i>"]
+                VAL_HEAD["ValueHead<br/>256 → 128 → tanh<br/>→ v ∈ [−1, 1]"]
+            end
+
+            MCTS_DETAIL --> POLICY
+        end
+    end
+
+    MODEL ==>|"trained model"| INFERENCE
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% SELF-PLAY LOOP
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph SELFPLAY["<b>Self-Play</b> &nbsp; training/self_play.py"]
+        SP_DETAIL["MCTS-guided trajectory generation<br/>→ (state, action, reward) tuples<br/>REINFORCE updates action policy + value network"]
+    end
+
+    MCTS_INF -->|"trajectories"| SELFPLAY
+    SELFPLAY -->|"policy gradient<br/>updates"| MODEL
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% VERIFICATION AT INFERENCE
+    %% ═══════════════════════════════════════════════════════════════
+    SAV_DETAIL -->|"candidate F"| VERIFY_MOD
+    ENV -->|"Close action"| VERIFY_MOD
+    VERIFY_MOD -->|"✓ correct / ✗ reject"| SAV_DETAIL
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% FEATURE FLOW
+    %% ═══════════════════════════════════════════════════════════════
+    F3 -.->|"40d analytical<br/>signatures"| STRUCT
+    F1 -.->|"264d + 16d + 24d<br/>curriculum scoring<br/>+ dataset analysis"| CURRIC
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% EQUIVALENCE CLASS GENERATION
+    %% ═══════════════════════════════════════════════════════════════
+    CANON -.->|"K equivalent<br/>antiderivatives"| EQCE
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% OUTPUT
+    %% ═══════════════════════════════════════════════════════════════
+    OUTPUT["<b>Output</b><br/>Verified antiderivative F(x)<br/>such that dF/dx = f(x)"]
+    SAV_DETAIL ==> OUTPUT
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% RESULTS
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph RESULTS["<b>Accuracy (sample-and-verify, n=25)</b>"]
+        direction LR
+        R1["Univariate<br/><b>99.7%</b> ±0.1"]
+        R2["Multivariate<br/><b>99.4%</b> ±0.2"]
+        R3["Definite<br/><b>99.5%</b> ±0.2"]
+        R4["Parametric<br/><b>99.1%</b> ±0.2"]
+        R5["Special fn<br/><b>97.3%</b> ±0.4"]
+    end
+
+    OUTPUT --- RESULTS
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% STYLING
+    %% ═══════════════════════════════════════════════════════════════
+    classDef rustBox fill:#2d1b00,stroke:#ff8c00,stroke-width:2px,color:#ffd699
+    classDef pyBox fill:#001a33,stroke:#4da6ff,stroke-width:2px,color:#b3d9ff
+    classDef trainBox fill:#1a0033,stroke:#9966ff,stroke-width:2px,color:#cc99ff
+    classDef inferBox fill:#002200,stroke:#66cc66,stroke-width:2px,color:#b3ffb3
+    classDef resultBox fill:#330000,stroke:#ff6666,stroke-width:2px,color:#ffcccc
+    classDef bridgeBox fill:#333300,stroke:#cccc00,stroke-width:1px,color:#ffff99
+
+    class RUST,GEN,DIFF_MOD,VERIFY_MOD,FEAT_RS,CANON,ENV_MOD rustBox
+    class DATA,TOK,DS,SPLIT_DS,MODEL,ENCODER,DECODER,EMBED,MSG,VAR_ATT,GRAMMAR pyBox
+    class TRAINING,LOSS_MOD,AUX,OPTIM,CURRIC,SELFPLAY trainBox
+    class INFERENCE,SAV,MCTS_INF,POLICY inferBox
+    class RESULTS resultBox
