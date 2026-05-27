@@ -32,164 +32,86 @@ The result: 12.1M parameters vs 95M, trainable on a single GPU, matching 99.7% a
 
 The system has four main components: data generation, the neural model, inference search, and verification.
 
+#### System Overview
+
+```mermaid
+flowchart LR
+    A["Random F(x)\ngeneration"] --> B["Differentiate\nf = dF/dx"] --> C["200M verified\n(f, F) pairs"]
+    C --> D["Tree GNN\nEncoder\n5.6M params"]
+    D --> E["Tree\nDecoder\n6.5M params"]
+    E --> F["25 candidates\nT=0.7"]
+    F --> G{"Verify:\nd/dx[F] = f ?"}
+    G -->|"pass"| H["Return F(x)"]
+    G -->|"all fail"| I["No solution"]
+    style A fill:#2d1b00,stroke:#ff8c00,color:#ffd699
+    style B fill:#2d1b00,stroke:#ff8c00,color:#ffd699
+    style C fill:#2d1b00,stroke:#ff8c00,color:#ffd699
+    style D fill:#001a33,stroke:#4da6ff,color:#b3d9ff
+    style E fill:#001a33,stroke:#4da6ff,color:#b3d9ff
+    style F fill:#002200,stroke:#66cc66,color:#b3ffb3
+    style G fill:#002200,stroke:#66cc66,color:#b3ffb3
+    style H fill:#002200,stroke:#66cc66,color:#b3ffb3
+```
+
+#### Data Generation (Rust)
+
 ```mermaid
 flowchart TB
-    subgraph RUST["Rust Core — rust/core/src/ — ~4K LOC, PyO3 → Python"]
+    subgraph gen ["gen.rs + gen_coverage.rs"]
+        SK["Skeleton enumeration\n200+ templates, 15 families\n90% of data"] --> M["200M pairs\n40M per type"]
+        RN["Random trees\ndepth ≤ 6, nodes ≤ 30\n10% of data"] --> M
+    end
+    M --> DF["diff.rs\nChain · Product · Quotient · Power\n+ smart constructors"]
+    DF --> PR["(f, F) pairs"]
+    PR --> VR["verify.rs"]
+    subgraph vr ["Verification cascade"]
+        V1["Structural\ndiff(F) == f ?"] -->|no| V2["Canonical\ne-graph rewrite"] -->|no| V3["Numerical\n20 pts, tol 1e-8"]
+    end
+    VR --> vr
+    FE["features.rs → 344d\nfunc heads 264 + var roles 16\nsignatures 40 + task/complexity 24"] -.-> PR
+    CAN["canonical.rs\negg e-graph\n20 rewrite rules"] -.->|"K equivalents"| PR
+```
+
+#### Neural Model (12.1M params)
+
+```mermaid
+flowchart TB
+    subgraph enc ["Encoder — 5.6M params"]
         direction TB
-
-        subgraph GEN["Data Generation — gen.rs + gen_coverage.rs"]
-            direction LR
-            SKEL["Skeleton Enumeration\n200+ templates × 15 families\nRandom coeff/exp injected\n90% of dataset"]
-            RAND["Random Tree Gen\ndepth≤6, nodes≤30\nBin 40% · Un 25% · Leaf 30%\n10% of dataset"]
-            SKEL --> MERGE_GEN["Merge\n200M pairs"]
-            RAND --> MERGE_GEN
-        end
-
-        subgraph DIFF_MOD["Differentiation — diff.rs"]
-            direction LR
-            DIFF["differentiate(F, var)\nChain · Product · Quotient\nPower · sin cos exp log\nsqrt erf Bessel …"]
-            SMART["Smart Constructors\nZero/one annihilation\nConstant folding\nDouble-neg cancellation"]
-            DIFF <--> SMART
-        end
-
-        subgraph VERIFY_MOD["Verification — verify.rs"]
-            V1["1. Structural: diff(F)==f?"] -->|no| V2["2. Canonical: e-graph rewrite"]
-            V2 -->|no| V3["3. Numerical: 20 pts, tol 1e-8"]
-            V3 -->|inconclusive| V4["4. Interval fallback"]
-        end
-
-        subgraph FEAT_RS["Feature Extraction — features.rs → 344d"]
-            direction LR
-            F1["Func heads 264d"]
-            F2["Var roles 16d"]
-            F3["Signatures 40d"]
-            F4["Task/complex 24d"]
-        end
-
-        subgraph CANON["Canonicalization — canonical.rs"]
-            EGG["E-graph equality saturation\negg crate · 20 rewrite rules"]
-        end
-
-        subgraph ENV_MOD["MCTS Environment — env.rs"]
-            ENV["4 actions: Substitute · IBP\nPartialFrac · Close"]
-        end
-
-        MERGE_GEN -->|"F(x) trees"| DIFF
-        DIFF -->|"f(x) = dF/dx"| PAIRS["200M verified pairs\nUni·Multi·Def·Param·Special\n40M each"]
-        PAIRS -->|spot-check| V1
+        NE["Node Embedding\nsymbol 64d + role 64d + struct 128d = 256d"]
+        PE["Tree PE (optional)\ndepth_index · rwse · laplacian"]
+        MP["Message Passing × 8 rounds\nparent↔child, MLP: 768→512→256\nresidual + layernorm"]
+        VA["Variable-Aware Attention\n8 heads, dependency mask"]
+        NE --> PE --> MP --> VA
     end
-
-    PAIRS ==>|"PyO3 FFI ~780K/sec w/ JSON"| DATASET
-
-    subgraph DATA["Data Pipeline — python/neurips/data/"]
-        TOKENIZER["Tokenizer — vocab 256\nBase-100 numbers\ntask VAR var PARAM FEAT prefix EOS"]
-        DATASET["Dataset — uint8 .pt shards\nsrc · tgt · features[344] · task · diff"]
-        SPLITR["80/20 random split\n160M train · 40M test"]
-        TOKENIZER --> DATASET --> SPLITR
+    subgraph dec ["Decoder — 6.5M params"]
+        direction TB
+        XA["8 cross-attention layers\n256d, 8 heads, SwiGLU FFN"]
+        SH["Symbol head → 256 vocab"]
+        CI["child_init: 256→512→L+R 256d"]
+        XA --> SH --> CI
     end
+    GM["Grammar mask\narity stack, O(1)/token\nvalid trees guaranteed"]
+    VA -->|"h[N, 256]"| XA
+    CI --> GM
+```
 
-    subgraph CURRIC["Curriculum — 4 phases over 90 epochs"]
+#### Training + Inference
+
+```mermaid
+flowchart TB
+    subgraph cur ["Curriculum — 90 epochs"]
         direction LR
-        PH1["Ep 1-10\nUnivariate\nEasy+Med"]
-        PH2["Ep 11-30\n+Multi\n→Hard"]
-        PH3["Ep 31-60\nAll 5 types\nAll tiers"]
-        PH4["Ep 61-90\nUniform"]
-        PH1 --> PH2 --> PH3 --> PH4
+        C1["1-10: Uni\neasy+med"] --> C2["11-30: +Multi\n→hard"] --> C3["31-60: All 5\nall tiers"] --> C4["61-90:\nuniform"]
     end
-
-    SPLITR ==>|train 160M| CURRIC
-
-    subgraph MODEL["Neural Model — 12.1M params"]
-        direction TB
-
-        subgraph ENCODER["Tree GNN Encoder ~5.6M — tree_gnn.py"]
-            direction TB
-            subgraph EMBED["Node Embedding → 256d"]
-                direction LR
-                SYM["Symbol\n256→64d"]
-                ROLE["Role MLP\n12→64d"]
-                STRUCT["Struct MLP\n40→128d"]
-                SYM --- CAT["concat\n= 256d"]
-                ROLE --- CAT
-                STRUCT --- CAT
-            end
-            PE["Tree PE (optional)\ndepth_index · rwse · laplacian"]
-            subgraph MSG["Message Passing — 8 rounds"]
-                MP["Parent→child + Child→parent\nUpdate: [h‖p_msg‖c_msg]=768→512→256\nResidual + LayerNorm"]
-            end
-            subgraph VATT["Variable-Aware Attention — 8 heads"]
-                VA["Dependency mask: x-dependent subtrees\nPairwise bias → 256d"]
-            end
-            CAT --> PE --> MSG --> VATT
-        end
-
-        subgraph DECODER["Tree Decoder ~6.5M — tree_decoder.py"]
-            DEC["Top-down BFS autoregressive\n8 cross-attn layers (256d, 8 heads)\n+ SwiGLU FFN per layer\nSymbol head → 256 vocab logits\nchild_init: 256→512→L/R 256d\nMax 8 levels"]
-        end
-
-        subgraph GRAMMAR["Grammar Mask — grammar.py"]
-            GRAM["ArityStack → valid token mask\nGuarantees syntactically valid trees\nO(1) per token"]
-        end
-
-        VATT ==>|"h[N,256]"| DEC --> GRAM
-    end
-
-    subgraph TRAINING["Training"]
-        EQCE["Equivalence-class CE\nmin_k CE(pred, target_k)\nGradient through closest target"]
-        subgraph AUX["Auxiliary Heads (0.1× weight)"]
-            direction LR
-            AUX_D["Difficulty → 4 classes"]
-            AUX_P["Depth → scalar MSE"]
-        end
-        OPT["AdamW lr=3e-4 · cosine anneal\nSWA at 75% · grad clip 1.0\nBF16 · torch.compile"]
-        EQCE --- OPT
-        AUX --- OPT
-    end
-
-    CURRIC ==>|batches| MODEL
-    MODEL -->|logits| EQCE
-    VATT -->|encoder out| AUX
-
-    subgraph INFERENCE["Inference"]
-        direction TB
-        subgraph SAV["Sample-and-Verify (DEFAULT)"]
-            SAV_D["25 candidates (T=0.7, top-p=0.95)\nDifferentiate each via Rust ~0.01ms\nReturn first where dF/dx = integrand\nP(success) > 99.99%"]
-        end
-        subgraph MCTS_INF["MCTS (optional research)"]
-            MCTS_D["PUCT c=1.4 · 100 sims · depth 10\nDirichlet noise · LRU 100K"]
-            subgraph POLICY["Policy + Value — action_policy.py"]
-                direction LR
-                AP["4-action MLP\n256→128→4"]
-                VH["ValueHead\n256→128→tanh"]
-            end
-            MCTS_D --> POLICY
-        end
-    end
-
-    MODEL ==>|trained| INFERENCE
-    SAV_D -->|"candidate F"| VERIFY_MOD
-    ENV -->|Close| VERIFY_MOD
-    VERIFY_MOD -->|"✓/✗"| SAV_D
-
-    subgraph SELFPLAY["Self-Play — self_play.py"]
-        SP["MCTS trajectories → REINFORCE\nUpdates policy + value"]
-    end
-    MCTS_INF --> SELFPLAY --> MODEL
-
-    F3 -.->|"40d"| STRUCT
-    CANON -.->|"K equivalents"| EQCE
-
-    SAV_D ==> OUTPUT["Verified antiderivative F(x)"]
-
-    subgraph RESULTS["Accuracy (n=25 samples)"]
-        direction LR
-        R1["Uni 99.7%"]
-        R2["Multi 99.4%"]
-        R3["Def 99.5%"]
-        R4["Param 99.1%"]
-        R5["Special 97.3%"]
-    end
-    OUTPUT --- RESULTS
+    cur -->|"160M train"| MDL["Model"]
+    MDL -->|logits| LOSS["Equiv-class CE\nmin_k CE(pred, target_k)"]
+    MDL --> AUX["Aux heads 0.1×\ndifficulty 4-class + depth MSE"]
+    LOSS --> OPT["AdamW 3e-4 · cosine anneal\nSWA · grad clip 1.0 · BF16"]
+    AUX --> OPT
+    MDL ==>|inference| SAV["Sample-and-Verify\n25 candidates, T=0.7, top-p=0.95\ndifferentiate each ~0.01ms\nP(success) > 99.99%"]
+    MDL -.->|optional| MCTS["MCTS\nPUCT c=1.4 · 100 sims\n4 actions · value head"]
+    MCTS -.-> SP["Self-play\nREINFORCE"] -.-> MDL
 ```
 
 ### 1. Data Generation (Rust)
